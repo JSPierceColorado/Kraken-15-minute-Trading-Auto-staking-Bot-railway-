@@ -6,6 +6,9 @@
 import os
 from dataclasses import dataclass
 
+def _to_bool(v: str) -> bool:
+    return str(v).lower() in ("1", "true", "yes")
+
 @dataclass
 class Settings:
     # Kraken keys (use CCXT for trading)
@@ -28,10 +31,23 @@ class Settings:
 
     # Staking / Profit sink
     PROFIT_SINK_SYMBOL: str = os.getenv("PROFIT_SINK_SYMBOL", "ATOM")
-    ENABLE_STAKING: bool = os.getenv("ENABLE_STAKING", "false").lower() in ("1", "true", "yes")
+    ENABLE_STAKING: bool = _to_bool(os.getenv("ENABLE_STAKING", "false"))
 
     # Safety
-    DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
+    DRY_RUN: bool = _to_bool(os.getenv("DRY_RUN", "true"))
 
+    # ---------- Asset-class filters (for Kraken tokenized equities = xStocks) ----------
+    # Scan normal crypto pairs?
+    INCLUDE_CRYPTO: bool = _to_bool(os.getenv("INCLUDE_CRYPTO", "true"))
+    # Scan tokenized equities (xStocks like AAPLx, TSLAx, SPYx)?
+    INCLUDE_XSTOCKS: bool = _to_bool(os.getenv("INCLUDE_XSTOCKS", "true"))
+    # If true, only scan xStocks (ignore crypto)
+    XSTOCKS_ONLY: bool = _to_bool(os.getenv("XSTOCKS_ONLY", "false"))
+    # Suffix Kraken uses for tokenized equities base symbols (e.g., AAPLx)
+    XSTOCKS_SUFFIX: str = os.getenv("XSTOCKS_SUFFIX", "x")
+    # Optional explicit whitelist of xStocks bases, comma-separated (e.g., "AAPLx,TSLAx,SPYx")
+    XSTOCKS_BASES: tuple = tuple(
+        b.strip().upper() for b in os.getenv("XSTOCKS_BASES", "").split(",") if b.strip()
+    )
 
 SETTINGS = Settings()
