@@ -22,7 +22,7 @@ def session_scope():
         s.close()
 
 
-# --- NEW: bootstrap + new-market detection -----------------------------------
+# --- bootstrap + new-market detection ----------------------------------------
 def seed_markets_if_empty(kr: KrakenClient) -> bool:
     """
     If the seen_markets table is empty, seed it with ALL current markets (no buys).
@@ -103,7 +103,7 @@ def screen_and_buy_signals(kr: KrakenClient):
                         s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
                     s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
                                    price=price, amount=qty, notional=price * qty))
-                # --- clarified logging here ---
+                # clarified logging
                 ma_fast = float(last['ma_fast'])
                 ma_slow = float(last['ma_slow'])
                 print(
@@ -115,23 +115,48 @@ def screen_and_buy_signals(kr: KrakenClient):
 
 
 def take_profits_and_sink(kr: KrakenClient):
+    """
+    SELL RULE (all must be true):
+      - RSI(14) >= 70
+      - MA60 > MA240  (15m bars)
+      - Price >= avg_cost * (1 + TAKE_PROFIT_PCT)
+    Never sell ATOM (profit sink asset).
+    """
     total_profit_usd = 0.0
     with session_scope() as s:
         positions = s.query(Position).all()
         for pos in positions:
-            # Never sell ATOM (profit sink asset)
+            # Never sell ATOM
             if pos.base == SETTINGS.PROFIT_SINK_SYMBOL:
                 continue
+
             sym = f"{pos.base}/{pos.quote}"
             try:
-                price = kr.fetch_ticker_price(sym)
-            except Exception:
+                # Need indicators to decide; fetch candles and compute
+                df = kr.fetch_ohlcv_df(sym, timeframe='15m',
+                                       limit=max(SETTINGS.SLOW_MA + 5, 260))
+                ind = compute_indicators(df, SETTINGS.RSI_LENGTH,
+                                         SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
+                last = ind.iloc[-1]
+                price = float(last['close'])
+                rsi_val = float(last['rsi'])
+                ma_fast = float(last['ma_fast'])
+                ma_slow = float(last['ma_slow'])
+            except Exception as e:
+                print(f"Sell check skipped for {sym} (indicator fetch failed): {e}")
                 continue
-            if price >= pos.avg_cost * (1.0 + SETTINGS.TAKE_PROFIT_PCT):
+
+            cond_rsi = rsi_val >= 70.0
+            cond_ma = ma_fast > ma_slow
+            target_price = pos.avg_cost * (1.0 + SETTINGS.TAKE_PROFIT_PCT)
+            cond_profit = price >= target_price
+
+            if cond_rsi and cond_ma and cond_profit:
                 sell_price, sold_qty = kr.market_sell_all(sym, pos.amount)
                 notional = sell_price * sold_qty
                 cost = pos.avg_cost * sold_qty
                 pnl = notional - cost
+                # only count USD/USDT for auto-sink
                 if pos.quote in ("USD", "USDT"):
                     total_profit_usd += pnl
                 s.add(TradeLog(side="SELL", symbol=sym, base=pos.base, quote=pos.quote,
@@ -142,7 +167,16 @@ def take_profits_and_sink(kr: KrakenClient):
                 bl = s.query(BuyLock).filter_by(base=pos.base, active=True).first()
                 if bl:
                     s.delete(bl)
-                print(f"TP SELL {sym}: sold {sold_qty:.8f} at {sell_price:.6f} pnl≈{pnl:.2f}")
+                profit_pct = (sell_price / pos.avg_cost - 1.0) * 100.0
+                print(
+                    f"SELL {sym}: rsi={rsi_val:.1f} (>=70), ma60={ma_fast:.6f} > ma240={ma_slow:.6f}, "
+                    f"price={sell_price:.6f} (avg={pos.avg_cost:.6f}, +{profit_pct:.2f}%), pnl≈{pnl:.2f}"
+                )
+            else:
+                # Optional debug line; comment out if noisy
+                # print(f"Hold {sym}: rsi={rsi_val:.1f}, ma60={ma_fast:.6f}, ma240={ma_slow:.6f}, "
+                #       f"price={price:.6f}, target≥{target_price:.6f}")
+                pass
 
     # Sink realized USD profits into ATOM
     if total_profit_usd > 0.0:
