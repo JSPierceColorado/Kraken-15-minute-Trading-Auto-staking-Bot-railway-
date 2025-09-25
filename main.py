@@ -24,6 +24,21 @@ def session_scope():
 def validate_settings():
     assert SETTINGS.FAST_MA < SETTINGS.SLOW_MA, "FAST_MA must be < SLOW_MA"
 
+# --- NEW: order sizing helper ---
+def compute_order_notional(kr: KrakenClient, quote: str) -> float:
+    """
+    Returns how much QUOTE (USD/USDT) to spend for this order based on env:
+      - ORDER_SIZE_MODE=USD -> ORDER_SIZE_USD
+      - ORDER_SIZE_MODE=PCT -> ORDER_SIZE_PCT * free balance of QUOTE
+    """
+    mode = (SETTINGS.ORDER_SIZE_MODE or "USD").upper()
+    if mode == "PCT":
+        avail = kr.get_free_balance(quote)
+        spend = max(0.0, avail * SETTINGS.ORDER_SIZE_PCT)
+        return spend
+    # default: fixed spend
+    return SETTINGS.ORDER_SIZE_USD
+
 # --- bootstrap + new-market detection ----------------------------------------
 def seed_markets_if_empty(kr: KrakenClient) -> bool:
     """
@@ -57,7 +72,11 @@ def find_new_markets(kr: KrakenClient):
 def buy_new_listings(kr: KrakenClient, new_symbols):
     for sym, base, quote in new_symbols:
         try:
-            price, qty = kr.market_buy_usd(sym, SETTINGS.MIN_NOTIONAL_USD)
+            order_notional = compute_order_notional(kr, quote)
+            if order_notional <= 0:
+                print(f"Skip new-listing buy {sym}: no available {quote} balance")
+                continue
+            price, qty = kr.market_buy_quote(sym, order_notional)
             with session_scope() as s:
                 if not s.query(BuyLock).filter_by(base=base).first():
                     s.add(BuyLock(base=base, active=True))
@@ -71,7 +90,7 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
                     s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
                 s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
                                price=price, amount=qty, notional=price * qty))
-            print(f"New listing buy: {sym} ${SETTINGS.MIN_NOTIONAL_USD:.2f} at {price:.6f}")
+            print(f"New listing buy: {sym} spend={order_notional:.2f} {quote} at {price:.6f}")
         except Exception as e:
             print(f"Failed new-listing buy for {sym}: {e}")
 
@@ -89,7 +108,11 @@ def screen_and_buy_signals(kr: KrakenClient):
                                      SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
             last = ind.iloc[-1]
             if buy_signal(last):
-                price, qty = kr.market_buy_usd(sym, SETTINGS.MIN_NOTIONAL_USD)
+                order_notional = compute_order_notional(kr, quote)
+                if order_notional <= 0:
+                    print(f"Skip signal buy {sym}: no available {quote} balance")
+                    continue
+                price, qty = kr.market_buy_quote(sym, order_notional)
                 with session_scope() as s:
                     s.add(BuyLock(base=base, active=True))
                     pos = s.query(Position).filter_by(base=base, quote=quote).first()
@@ -107,7 +130,8 @@ def screen_and_buy_signals(kr: KrakenClient):
                 ma_slow = float(last['ma_slow'])
                 print(
                     f"Signal BUY {sym}: rsi={last['rsi']:.1f}, "
-                    f"ma60={ma_fast:.6f} < ma240={ma_slow:.6f}, price={price:.6f}"
+                    f"ma60={ma_fast:.6f} < ma240={ma_slow:.6f}, price={price:.6f}, "
+                    f"spend={order_notional:.2f} {quote}"
                 )
         except Exception as e:
             print(f"Screening error {sym}: {e}")
