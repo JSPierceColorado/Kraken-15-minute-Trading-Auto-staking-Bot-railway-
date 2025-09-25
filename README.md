@@ -24,20 +24,25 @@
 | `KRAKEN_API_SECRET` |  | Kraken API secret |
 | `DATABASE_URL` | `sqlite:///./state.db` | Use Railway Postgres for persistence in prod |
 | `QUOTE_ASSETS` | `USD,USDT` | Quotes to scan |
-| `MIN_NOTIONAL_USD` | `1.0` | Per-buy USD spend |
 | `RSI_LENGTH` | `14` | RSI period |
 | `FAST_MA` | `60` | Fast MA window (15m bars) |
 | `SLOW_MA` | `240` | Slow MA window (15m bars) |
 | `TAKE_PROFIT_PCT` | `0.075` | Profit threshold (7.5%) |
-| `LOOP_SLEEP_SECONDS` | `900` | Used only in loop mode |
 | `PROFIT_SINK_SYMBOL` | `ATOM` | Profit sink asset |
 | `ENABLE_STAKING` | `false` | Placeholder call (no real API yet) |
 | `DRY_RUN` | `true` | If `true`, simulate orders |
+| **`ORDER_SIZE_MODE`** | `USD` | `USD` = fixed spend, `PCT` = percent of available quote balance |
+| **`ORDER_SIZE_USD`** | `1.0` | Fixed spend per buy when `ORDER_SIZE_MODE=USD` |
+| **`ORDER_SIZE_PCT`** | `0.01` | Percent (e.g. `0.01` = 1%) of free quote balance when `ORDER_SIZE_MODE=PCT` |
 | `INCLUDE_CRYPTO` | `true` | Include regular crypto pairs |
 | `INCLUDE_XSTOCKS` | `true` | Include tokenized equities (e.g., `AAPLx`) |
 | `XSTOCKS_ONLY` | `false` | If `true`, scan only xStocks |
 | `XSTOCKS_SUFFIX` | `x` | Suffix marking xStocks bases |
 | `XSTOCKS_BASES` | *(empty)* | Comma list to force-treat as xStocks |
+
+### Examples
+**Fixed $1 per buy (current default):**
+
 
 ## Railway setup
 1. Create a new Railway service from this repo.
