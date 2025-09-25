@@ -12,7 +12,6 @@ Base = declarative_base()
 engine = create_engine(SETTINGS.DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-
 class SeenMarket(Base):
     __tablename__ = "seen_markets"
 
@@ -21,7 +20,6 @@ class SeenMarket(Base):
     base = Column(String, index=True)
     quote = Column(String, index=True)
     first_seen = Column(DateTime, server_default=func.now())
-
 
 class Position(Base):
     __tablename__ = "positions"
@@ -32,9 +30,7 @@ class Position(Base):
     amount = Column(Float)             # base amount currently held (from our buys)
     avg_cost = Column(Float)           # in quote (e.g., USD per base)
     last_updated = Column(DateTime, server_default=func.now(), onupdate=func.now())
-
     __table_args__ = (UniqueConstraint("base", "quote", name="uix_base_quote"),)
-
 
 class BuyLock(Base):
     __tablename__ = "buy_locks"
@@ -42,9 +38,7 @@ class BuyLock(Base):
     id = Column(Integer, primary_key=True)
     base = Column(String, index=True)
     active = Column(Boolean, default=True)  # ensures only one active buy at a time per asset
-
     __table_args__ = (UniqueConstraint("base", name="uix_buylock_base"),)
-
 
 class TradeLog(Base):
     __tablename__ = "trades"
@@ -59,7 +53,6 @@ class TradeLog(Base):
     notional = Column(Float)
     pnl = Column(Float, nullable=True) # for sells
     ts = Column(DateTime, server_default=func.now())
-
 
 def init_db():
     Base.metadata.create_all(engine)
