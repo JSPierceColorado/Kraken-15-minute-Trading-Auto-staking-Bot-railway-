@@ -1,41 +1,59 @@
-# Kraken 15‑Minute Trading & Auto-Staking Bot (Railway)
-
+# Kraken 15-Minute Trading & Auto-Staking Bot (Railway)
 
 ## What it does
-- Every 15 minutes, screens all active Kraken markets with quotes in USD/USDT.
-- **New listings**: first time a market is seen, buys $1 notional.
-- **Signal buys**: Buys $1 when RSI(14) <= 30 **and** MA(60) < MA(240) on 15‑minute candles.
-- Ensures **one active buy lock per base asset**.
-- Takes profit by selling full position at **+7.5%** over avg cost.
-- Redirects realized profits to **ATOM**; optionally attempts staking (placeholder).
-- Never sells ATOM.
+- Screens **all active Kraken markets** with quotes in `USD`/`USDT` every 15 minutes.
+- **New listings**: first time the bot discovers a market **after** bootstrap, it buys **$1**.
+- **Signal buys**: Buys **$1** when **RSI(14) ≤ 30** **and** **MA(60) < MA(240)** on **15-minute** bars.
+- Ensures **one active buy per base asset** via a buy-lock.
+- **Sell rule (all must be true)**:  
+  1) **RSI(14) ≥ 70**  
+  2) **MA(60) > MA(240)** (15m)  
+  3) **Price ≥ avg_cost × (1 + 7.5%)**  
+- **Never sells ATOM**; realized USD/USDT profits are converted to **ATOM**. (Optional placeholder to stake.)
 
+## Tokenized Equities (xStocks)
+- Supports **xStocks** like `AAPLx/USD`, `TSLAx/USD`, `SPYx/USD`.  
+- Uses the same CCXT-based flow as crypto; toggle with env vars below.
+
+> Note: Native U.S. equities/ETFs (non-tokenized) require Kraken’s equities API; this bot targets Kraken Pro spot (including tokenized equities) via CCXT.
 
 ## Environment Variables
-- `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` – Kraken credentials
-- `DATABASE_URL` – e.g., `postgresql://user:pass@host:5432/db` or default `sqlite:///./state.db`
-- `QUOTE_ASSETS` – Comma list of quote currencies to scan (default `USD,USDT`)
-- `MIN_NOTIONAL_USD` – Per-buy spend (default `1.0`)
-- `RSI_LENGTH` – RSI period (default `14`)
-- `FAST_MA` – Fast MA window in bars (default `60`)
-- `SLOW_MA` – Slow MA window in bars (default `240`)
-- `TAKE_PROFIT_PCT` – e.g., `0.075` for 7.5%
-- `LOOP_SLEEP_SECONDS` – if using looped runner (default 900)
-- `PROFIT_SINK_SYMBOL` – default `ATOM`
-- `ENABLE_STAKING` – `true/false` to attempt staking placeholder
-- `DRY_RUN` – `true/false`; when `true` no orders are sent
-
+| Name | Default | Description |
+|---|---:|---|
+| `KRAKEN_API_KEY` |  | Kraken API key |
+| `KRAKEN_API_SECRET` |  | Kraken API secret |
+| `DATABASE_URL` | `sqlite:///./state.db` | Use Railway Postgres for persistence in prod |
+| `QUOTE_ASSETS` | `USD,USDT` | Quotes to scan |
+| `MIN_NOTIONAL_USD` | `1.0` | Per-buy USD spend |
+| `RSI_LENGTH` | `14` | RSI period |
+| `FAST_MA` | `60` | Fast MA window (15m bars) |
+| `SLOW_MA` | `240` | Slow MA window (15m bars) |
+| `TAKE_PROFIT_PCT` | `0.075` | Profit threshold (7.5%) |
+| `LOOP_SLEEP_SECONDS` | `900` | Used only in loop mode |
+| `PROFIT_SINK_SYMBOL` | `ATOM` | Profit sink asset |
+| `ENABLE_STAKING` | `false` | Placeholder call (no real API yet) |
+| `DRY_RUN` | `true` | If `true`, simulate orders |
+| `INCLUDE_CRYPTO` | `true` | Include regular crypto pairs |
+| `INCLUDE_XSTOCKS` | `true` | Include tokenized equities (e.g., `AAPLx`) |
+| `XSTOCKS_ONLY` | `false` | If `true`, scan only xStocks |
+| `XSTOCKS_SUFFIX` | `x` | Suffix marking xStocks bases |
+| `XSTOCKS_BASES` | *(empty)* | Comma list to force-treat as xStocks |
 
 ## Railway setup
 1. Create a new Railway service from this repo.
-2. Add environment variables (`KRAKEN_API_KEY`, `KRAKEN_API_SECRET`, etc.).
-3. For persistence, prefer a Railway **Postgres** plugin; set `DATABASE_URL` accordingly.
+2. Add environment variables (see above). Start with `DRY_RUN=true`.
+3. For persistence, attach **Railway Postgres** and set `DATABASE_URL`.
 4. Enable **Cron** with `*/15 * * * *` running `python main.py`.
 
+## Notes
+- On the **first ever run**, the bot **seeds** all existing markets into `seen_markets` without buying. Only markets added **after** that are treated as “new listings.”
+- Orders are **market** orders for simplicity and tiny notionals. For bigger sizes, add slippage controls.
+- **Never sells ATOM**; profits are converted into ATOM. Staking is a placeholder until supported endpoints exist.
+- Ensure `FAST_MA < SLOW_MA` (asserted at startup).
 
-## Notes & Caveats
-- CCXT abstracts Kraken trading & candles. Staking (Kraken Earn) is **not** supported via CCXT; the `stake_atom` call is a placeholder. Depending on your jurisdiction, Earn/Staking may be restricted—verify with Kraken before enabling.
-- Profit calculation uses our tracked average cost per position. If you have external deposits/trades, reconcile or reset the DB to avoid mismatched PnL.
-- “Newly listed” is defined as the first time this bot observes a symbol in `load_markets()`; it will buy $1 immediately. If you redeploy without DB persistence, it may re-buy. Use a persisted DB.
-- This bot does **market** orders for simplicity and tiny notionals; for larger sizes consider slippage controls.
-- DRY_RUN defaults to `true`. Set `DRY_RUN=false` to trade live.
+## Local dev
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
