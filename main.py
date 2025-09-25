@@ -103,7 +103,13 @@ def screen_and_buy_signals(kr: KrakenClient):
                         s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
                     s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
                                    price=price, amount=qty, notional=price * qty))
-                print(f"Signal BUY {sym}: rsi={last['rsi']:.1f} ma60<{last['ma_slow']:.6f}? at {price:.6f}")
+                # --- clarified logging here ---
+                ma_fast = float(last['ma_fast'])
+                ma_slow = float(last['ma_slow'])
+                print(
+                    f"Signal BUY {sym}: rsi={last['rsi']:.1f}, "
+                    f"ma60={ma_fast:.6f} < ma240={ma_slow:.6f}, price={price:.6f}"
+                )
         except Exception as e:
             print(f"Screening error {sym}: {e}")
 
