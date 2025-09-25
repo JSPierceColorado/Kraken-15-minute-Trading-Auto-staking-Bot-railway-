@@ -21,6 +21,8 @@ def session_scope():
     finally:
         s.close()
 
+def validate_settings():
+    assert SETTINGS.FAST_MA < SETTINGS.SLOW_MA, "FAST_MA must be < SLOW_MA"
 
 # --- bootstrap + new-market detection ----------------------------------------
 def seed_markets_if_empty(kr: KrakenClient) -> bool:
@@ -38,7 +40,6 @@ def seed_markets_if_empty(kr: KrakenClient) -> bool:
     print(f"Bootstrap: seeded {len(syms)} markets — no buys on first run.")
     return True
 
-
 def find_new_markets(kr: KrakenClient):
     """
     Return only markets that are NOT in seen_markets yet (true new listings since last run).
@@ -52,7 +53,6 @@ def find_new_markets(kr: KrakenClient):
                 new_symbols.append((sym, base, quote))
     return new_symbols
 # -----------------------------------------------------------------------------
-
 
 def buy_new_listings(kr: KrakenClient, new_symbols):
     for sym, base, quote in new_symbols:
@@ -74,7 +74,6 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
             print(f"New listing buy: {sym} ${SETTINGS.MIN_NOTIONAL_USD:.2f} at {price:.6f}")
         except Exception as e:
             print(f"Failed new-listing buy for {sym}: {e}")
-
 
 def screen_and_buy_signals(kr: KrakenClient):
     syms = kr.list_screenable_symbols()
@@ -112,7 +111,6 @@ def screen_and_buy_signals(kr: KrakenClient):
                 )
         except Exception as e:
             print(f"Screening error {sym}: {e}")
-
 
 def take_profits_and_sink(kr: KrakenClient):
     """
@@ -156,7 +154,6 @@ def take_profits_and_sink(kr: KrakenClient):
                 notional = sell_price * sold_qty
                 cost = pos.avg_cost * sold_qty
                 pnl = notional - cost
-                # only count USD/USDT for auto-sink
                 if pos.quote in ("USD", "USDT"):
                     total_profit_usd += pnl
                 s.add(TradeLog(side="SELL", symbol=sym, base=pos.base, quote=pos.quote,
@@ -173,7 +170,7 @@ def take_profits_and_sink(kr: KrakenClient):
                     f"price={sell_price:.6f} (avg={pos.avg_cost:.6f}, +{profit_pct:.2f}%), pnl≈{pnl:.2f}"
                 )
             else:
-                # Optional debug line; comment out if noisy
+                # Optional debug:
                 # print(f"Hold {sym}: rsi={rsi_val:.1f}, ma60={ma_fast:.6f}, ma240={ma_slow:.6f}, "
                 #       f"price={price:.6f}, target≥{target_price:.6f}")
                 pass
@@ -189,8 +186,8 @@ def take_profits_and_sink(kr: KrakenClient):
         except Exception as e:
             print(f"Failed profit sink buy ATOM: {e}")
 
-
 def run_once():
+    validate_settings()
     init_db()
     kr = KrakenClient()
 
@@ -205,7 +202,6 @@ def run_once():
 
     screen_and_buy_signals(kr)
     take_profits_and_sink(kr)
-
 
 if __name__ == "__main__":
     run_once()
