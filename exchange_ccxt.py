@@ -71,15 +71,29 @@ class KrakenClient:
         t = self.x.fetch_ticker(symbol)
         return float(t['last'])
 
-    def market_buy_usd(self, symbol: str, usd_amount: float) -> Tuple[float, float]:
-        # market buy spending usd_amount of QUOTE
+    # --- NEW: balance + quote-notional buy helpers ---
+    def get_free_balance(self, currency: str) -> float:
+        try:
+            bal = self.x.fetch_free_balance()
+            return float(bal.get(currency, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def market_buy_quote(self, symbol: str, quote_notional: float) -> Tuple[float, float]:
+        """
+        Market buy spending 'quote_notional' units of the QUOTE currency (USD/USDT).
+        Returns (price, base_qty).
+        """
         price = self.fetch_ticker_price(symbol)
-        base_qty = usd_amount / price if price > 0 else 0.0
+        base_qty = quote_notional / price if price > 0 else 0.0
         if SETTINGS.DRY_RUN:
             return price, base_qty
-        # Kraken CCXT: amount is base currency units
         self.x.create_order(symbol, type='market', side='buy', amount=base_qty)
         return price, base_qty
+
+    # Back-compat shim
+    def market_buy_usd(self, symbol: str, usd_amount: float):
+        return self.market_buy_quote(symbol, usd_amount)
 
     def market_sell_all(self, symbol: str, base_qty: float) -> Tuple[float, float]:
         price = self.fetch_ticker_price(symbol)
@@ -93,12 +107,11 @@ class KrakenClient:
         for q in SETTINGS.QUOTE_ASSETS:
             sym = f"{SETTINGS.PROFIT_SINK_SYMBOL}/{q}"
             try:
-                return self.market_buy_usd(sym, usd_amount)
+                return self.market_buy_quote(sym, usd_amount)
             except Exception:
                 continue
         raise RuntimeError("No ATOM/* market available for quotes: " + ",".join(SETTINGS.QUOTE_ASSETS))
 
     def stake_atom(self, base_qty: float) -> None:
         # Placeholder: Kraken Earn/Equities staking endpoints aren’t available via CCXT.
-        # If/when Kraken exposes this, wire it here.
         pass
