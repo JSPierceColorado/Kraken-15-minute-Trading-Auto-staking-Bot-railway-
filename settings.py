@@ -20,11 +20,19 @@ class Settings:
 
     # Trading params
     QUOTE_ASSETS: tuple = tuple(os.getenv("QUOTE_ASSETS", "USD,USDT").split(","))
+    # Legacy min notional kept for compatibility (no longer used when ORDER_SIZE_* present)
     MIN_NOTIONAL_USD: float = float(os.getenv("MIN_NOTIONAL_USD", "1.0"))
     RSI_LENGTH: int = int(os.getenv("RSI_LENGTH", "14"))
     FAST_MA: int = int(os.getenv("FAST_MA", "60"))      # 60×15m bars
     SLOW_MA: int = int(os.getenv("SLOW_MA", "240"))     # 240×15m bars
     TAKE_PROFIT_PCT: float = float(os.getenv("TAKE_PROFIT_PCT", "0.075"))
+
+    # --- NEW: Order sizing ---
+    # Mode: "USD" (fixed spend) or "PCT" (percent of available quote balance)
+    ORDER_SIZE_MODE: str = os.getenv("ORDER_SIZE_MODE", "USD")
+    ORDER_SIZE_USD: float = float(os.getenv("ORDER_SIZE_USD", "1.0"))
+    # 0.01 = 1% of available funds in the quote currency (USD/USDT)
+    ORDER_SIZE_PCT: float = float(os.getenv("ORDER_SIZE_PCT", "0.01"))
 
     # Scheduling
     LOOP_SLEEP_SECONDS: int = int(os.getenv("LOOP_SLEEP_SECONDS", str(15 * 60)))
