@@ -23,8 +23,13 @@ def session_scope():
 
 def validate_settings():
     assert SETTINGS.FAST_MA < SETTINGS.SLOW_MA, "FAST_MA must be < SLOW_MA"
+    # Optional moonshot controls (safe defaults)
+    if getattr(SETTINGS, "ENABLE_MOONSHOT", False):
+        frac = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7))
+        assert 0.0 < frac < 1.0, "MOONSHOT_SELL_FRACTION must be in (0,1)"
 
 # --- NEW: order sizing helper ---
+
 def compute_order_notional(kr: KrakenClient, quote: str) -> float:
     """
     Returns how much QUOTE (USD/USDT) to spend for this order based on env:
@@ -40,6 +45,7 @@ def compute_order_notional(kr: KrakenClient, quote: str) -> float:
     return SETTINGS.ORDER_SIZE_USD
 
 # --- bootstrap + new-market detection ----------------------------------------
+
 def seed_markets_if_empty(kr: KrakenClient) -> bool:
     """
     If the seen_markets table is empty, seed it with ALL current markets (no buys).
@@ -55,6 +61,7 @@ def seed_markets_if_empty(kr: KrakenClient) -> bool:
     print(f"Bootstrap: seeded {len(syms)} markets — no buys on first run.")
     return True
 
+
 def find_new_markets(kr: KrakenClient):
     """
     Return only markets that are NOT in seen_markets yet (true new listings since last run).
@@ -68,6 +75,7 @@ def find_new_markets(kr: KrakenClient):
                 new_symbols.append((sym, base, quote))
     return new_symbols
 # -----------------------------------------------------------------------------
+
 
 def buy_new_listings(kr: KrakenClient, new_symbols):
     for sym, base, quote in new_symbols:
@@ -93,6 +101,7 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
             print(f"New listing buy: {sym} spend={order_notional:.2f} {quote} at {price:.6f}")
         except Exception as e:
             print(f"Failed new-listing buy for {sym}: {e}")
+
 
 def screen_and_buy_signals(kr: KrakenClient):
     syms = kr.list_screenable_symbols()
@@ -130,11 +139,12 @@ def screen_and_buy_signals(kr: KrakenClient):
                 ma_slow = float(last['ma_slow'])
                 print(
                     f"Signal BUY {sym}: rsi={last['rsi']:.1f}, "
-                    f"ma60={ma_fast:.6f} < ma240={ma_slow:.6f}, price={price:.6f}, "
+                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} > ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={price:.6f}, "
                     f"spend={order_notional:.2f} {quote}"
                 )
         except Exception as e:
             print(f"Screening error {sym}: {e}")
+
 
 def take_profits_and_sink(kr: KrakenClient):
     """
@@ -143,6 +153,10 @@ def take_profits_and_sink(kr: KrakenClient):
       - MA60 > MA240  (15m bars)
       - Price >= avg_cost * (1 + TAKE_PROFIT_PCT)
     Never sell ATOM (profit sink asset).
+
+    NEW: If ENABLE_MOONSHOT is True, when take-profit triggers we sell only a fraction
+    (MOONSHOT_SELL_FRACTION) and keep the remainder to potentially ride a moonshot.
+    BuyLock remains active while any position remains.
     """
     total_profit_usd = 0.0
     with session_scope() as s:
@@ -173,29 +187,56 @@ def take_profits_and_sink(kr: KrakenClient):
             target_price = pos.avg_cost * (1.0 + SETTINGS.TAKE_PROFIT_PCT)
             cond_profit = price >= target_price
 
-            if cond_rsi and cond_ma and cond_profit:
-                sell_price, sold_qty = kr.market_sell_all(sym, pos.amount)
-                notional = sell_price * sold_qty
-                cost = pos.avg_cost * sold_qty
+            should_take_profit = cond_rsi and cond_ma and cond_profit
+
+            if should_take_profit:
+                # Decide full vs partial exit
+                enable_moonshot = bool(getattr(SETTINGS, "ENABLE_MOONSHOT", False))
+                sell_fraction = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7)) if enable_moonshot else 1.0
+                sell_fraction = min(max(sell_fraction, 0.0), 1.0)
+
+                sell_qty = pos.amount * sell_fraction
+                # Ensure we don't leave dust below minimal tradable size unintentionally
+                if sell_fraction < 1.0 and sell_qty <= 0:
+                    # nothing meaningful to sell
+                    continue
+
+                # Execute the sale of the chosen fraction
+                sell_price, actually_sold = kr.market_sell_all(sym, sell_qty)
+                notional = sell_price * actually_sold
+                cost = pos.avg_cost * actually_sold
                 pnl = notional - cost
                 if pos.quote in ("USD", "USDT"):
                     total_profit_usd += pnl
+
                 s.add(TradeLog(side="SELL", symbol=sym, base=pos.base, quote=pos.quote,
-                               price=sell_price, amount=sold_qty,
-                               notional=notional, pnl=pnl))
-                # Clear position and its buy-lock
-                s.delete(pos)
-                bl = s.query(BuyLock).filter_by(base=pos.base, active=True).first()
-                if bl:
-                    s.delete(bl)
-                profit_pct = (sell_price / pos.avg_cost - 1.0) * 100.0
-                print(
-                    f"SELL {sym}: rsi={rsi_val:.1f} (>=70), ma60={ma_fast:.6f} > ma240={ma_slow:.6f}, "
-                    f"price={sell_price:.6f} (avg={pos.avg_cost:.6f}, +{profit_pct:.2f}%), pnl≈{pnl:.2f}"
-                )
+                               price=sell_price, amount=actually_sold, notional=notional, pnl=pnl))
+
+                remaining = pos.amount - actually_sold
+                if remaining <= 0:
+                    # Full exit path — clear position and its buy-lock
+                    s.delete(pos)
+                    bl = s.query(BuyLock).filter_by(base=pos.base, active=True).first()
+                    if bl:
+                        s.delete(bl)
+                    profit_pct = (sell_price / pos.avg_cost - 1.0) * 100.0
+                    print(
+                        f"SELL {sym}: rsi={rsi_val:.1f} (>=70), ma{SETTINGS.FAST_MA}={ma_fast:.6f} > "
+                        f"ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={sell_price:.6f} (avg={pos.avg_cost:.6f}, "
+                        f"+{profit_pct:.2f}%), pnl≈{pnl:.2f}"
+                    )
+                else:
+                    # Partial exit path — keep position and lock active, update avg_cost if desired
+                    # We keep avg_cost unchanged (reflects original cost of remaining units).
+                    pos.amount = remaining
+                    # Keep BuyLock active so we don't pyramid while moonshot is open
+                    print(
+                        f"PARTIAL SELL {sym}: sold={actually_sold:.6f}, remain={remaining:.6f}, "
+                        f"pnl≈{pnl:.2f}. Moonshot portion left to run."
+                    )
             else:
                 # Optional debug:
-                # print(f"Hold {sym}: rsi={rsi_val:.1f}, ma60={ma_fast:.6f}, ma240={ma_slow:.6f}, "
+                # print(f"Hold {sym}: rsi={rsi_val:.1f}, ma{SETTINGS.FAST_MA}={ma_fast:.6f}, ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, "
                 #       f"price={price:.6f}, target≥{target_price:.6f}")
                 pass
 
@@ -209,6 +250,7 @@ def take_profits_and_sink(kr: KrakenClient):
                 print("(Attempted to stake ATOM via placeholder—verify API support)")
         except Exception as e:
             print(f"Failed profit sink buy ATOM: {e}")
+
 
 def run_once():
     validate_settings()
@@ -226,6 +268,7 @@ def run_once():
 
     screen_and_buy_signals(kr)
     take_profits_and_sink(kr)
+
 
 if __name__ == "__main__":
     run_once()
