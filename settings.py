@@ -1,10 +1,12 @@
-# =============================
-# settings.py
-# =============================
+import os
 
 class Settings:
     # --- Database ---
-    DATABASE_URL = "sqlite:///./trading.db"  # or your Postgres URL
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./trading.db")
+
+    # --- API keys ---
+    KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
+    KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
     # --- Indicator settings ---
     RSI_LENGTH = 14
