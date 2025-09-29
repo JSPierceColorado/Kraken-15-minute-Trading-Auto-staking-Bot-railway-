@@ -1,61 +1,36 @@
 # =============================
 # settings.py
 # =============================
-# Centralized configuration & env parsing
 
-import os
-from dataclasses import dataclass
-
-def _to_bool(v: str) -> bool:
-    return str(v).lower() in ("1", "true", "yes")
-
-@dataclass
 class Settings:
-    # Kraken keys (use CCXT for trading)
-    KRAKEN_API_KEY: str = os.getenv("KRAKEN_API_KEY", "")
-    KRAKEN_API_SECRET: str = os.getenv("KRAKEN_API_SECRET", "")
+    # --- Indicator settings ---
+    RSI_LENGTH = 14
+    FAST_MA = 60
+    SLOW_MA = 240
 
-    # Database
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./state.db")
+    # --- Order sizing ---
+    # ORDER_SIZE_MODE = "USD" or "PCT"
+    ORDER_SIZE_MODE = "USD"
+    ORDER_SIZE_USD = 20.0         # used if mode=USD
+    ORDER_SIZE_PCT = 0.05         # used if mode=PCT (fraction of free balance)
 
-    # Trading params
-    QUOTE_ASSETS: tuple = tuple(os.getenv("QUOTE_ASSETS", "USD,USDT").split(","))
-    # Legacy min notional kept for compatibility (no longer used when ORDER_SIZE_* present)
-    MIN_NOTIONAL_USD: float = float(os.getenv("MIN_NOTIONAL_USD", "1.0"))
-    RSI_LENGTH: int = int(os.getenv("RSI_LENGTH", "14"))
-    FAST_MA: int = int(os.getenv("FAST_MA", "60"))      # 60×15m bars
-    SLOW_MA: int = int(os.getenv("SLOW_MA", "240"))     # 240×15m bars
-    TAKE_PROFIT_PCT: float = float(os.getenv("TAKE_PROFIT_PCT", "0.075"))
+    # --- Profit taking ---
+    TAKE_PROFIT_PCT = 0.10        # 10% profit target
 
-    # --- NEW: Order sizing ---
-    # Mode: "USD" (fixed spend) or "PCT" (percent of available quote balance)
-    ORDER_SIZE_MODE: str = os.getenv("ORDER_SIZE_MODE", "USD")
-    ORDER_SIZE_USD: float = float(os.getenv("ORDER_SIZE_USD", "1.0"))
-    # 0.01 = 1% of available funds in the quote currency (USD/USDT)
-    ORDER_SIZE_PCT: float = float(os.getenv("ORDER_SIZE_PCT", "0.01"))
+    # --- Profit sink ---
+    PROFIT_SINK_SYMBOL = "ATOM"   # asset to accumulate profits
+    ENABLE_STAKING = False        # placeholder; depends on exchange API
 
-    # Scheduling
-    LOOP_SLEEP_SECONDS: int = int(os.getenv("LOOP_SLEEP_SECONDS", str(15 * 60)))
+    # --- Loop settings ---
+    LOOP_SLEEP_SECONDS = 60       # delay between run_once() iterations
 
-    # Staking / Profit sink
-    PROFIT_SINK_SYMBOL: str = os.getenv("PROFIT_SINK_SYMBOL", "ATOM")
-    ENABLE_STAKING: bool = _to_bool(os.getenv("ENABLE_STAKING", "false"))
+    # --- Fees & backtest defaults ---
+    TAKER_FEE_PCT = 0.001         # 0.1% fee assumption
+    MIN_NOTIONAL = 5.0            # fallback if exchange rules unavailable
+    BACKTEST_SEED_CASH = 10_000.0
 
-    # Safety
-    DRY_RUN: bool = _to_bool(os.getenv("DRY_RUN", "true"))
-
-    # ---------- Asset-class filters (for Kraken tokenized equities = xStocks) ----------
-    # Scan normal crypto pairs?
-    INCLUDE_CRYPTO: bool = _to_bool(os.getenv("INCLUDE_CRYPTO", "true"))
-    # Scan tokenized equities (xStocks like AAPLx, TSLAx, SPYx)?
-    INCLUDE_XSTOCKS: bool = _to_bool(os.getenv("INCLUDE_XSTOCKS", "true"))
-    # If true, only scan xStocks (ignore crypto)
-    XSTOCKS_ONLY: bool = _to_bool(os.getenv("XSTOCKS_ONLY", "false"))
-    # Suffix Kraken uses for tokenized equities base symbols (e.g., AAPLx)
-    XSTOCKS_SUFFIX: str = os.getenv("XSTOCKS_SUFFIX", "x")
-    # Optional explicit whitelist of xStocks bases, comma-separated (e.g., "AAPLx,TSLAx,SPYx")
-    XSTOCKS_BASES: tuple = tuple(
-        b.strip().upper() for b in os.getenv("XSTOCKS_BASES", "").split(",") if b.strip()
-    )
+    # --- NEW: moonshot mode ---
+    ENABLE_MOONSHOT = False       # False = behave as before
+    MOONSHOT_SELL_FRACTION = 0.70 # fraction to sell at TP if enabled (0.7 = 70%)
 
 SETTINGS = Settings()
