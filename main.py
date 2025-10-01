@@ -1,14 +1,295 @@
 # =============================
-# main.py
+# main.py (all-in-one)
 # =============================
-# Orchestrates screening, trading, selling, and profit sink.
+# Orchestrates screening, trading, selling, and profit sink on Kraken via CCXT.
+# Combines settings, db models, exchange wrapper, indicators, and runner.
 
+import os
 from contextlib import contextmanager
-from settings import SETTINGS
-from db import init_db, SessionLocal, SeenMarket, Position, BuyLock, TradeLog
-from exchange_ccxt import KrakenClient
-from strategy import compute_indicators, buy_signal
+from typing import List, Dict, Tuple
 
+import pandas as pd
+import ccxt
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, DateTime,
+    UniqueConstraint, Boolean
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.sql import func
+
+
+# -------------------------
+# Settings (from settings.py)
+# -------------------------
+def _get_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _get_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    try:
+        return float(val) if val is not None else default
+    except Exception:
+        return default
+
+def _get_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    try:
+        return int(val) if val is not None else default
+    except Exception:
+        return default
+
+def _get_csv(name: str, default_list):
+    val = os.getenv(name)
+    if not val:
+        return list(default_list)
+    return [x.strip() for x in val.split(",") if x.strip()]
+
+class Settings:
+    # --- Database ---
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./trading.db")
+
+    # --- API keys ---
+    KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
+    KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
+
+    # --- Universe / filters ---
+    QUOTE_ASSETS   = _get_csv("QUOTE_ASSETS", ["USD", "USDT"])
+    INCLUDE_CRYPTO = _get_bool("INCLUDE_CRYPTO", True)
+    INCLUDE_XSTOCKS = _get_bool("INCLUDE_XSTOCKS", True)
+    XSTOCKS_ONLY   = _get_bool("XSTOCKS_ONLY", False)
+    XSTOCKS_SUFFIX = os.getenv("XSTOCKS_SUFFIX", "x")        # e.g., "AAPLx"
+    XSTOCKS_BASES  = set(_get_csv("XSTOCKS_BASES", []))      # explicit whitelist as xStocks
+
+    # Optional guardrails (unused in core flow but safe to keep)
+    MIN_24H_VOLUME = _get_float("MIN_24H_VOLUME", 0.0)
+    BASE_BLACKLIST = set(_get_csv("BASE_BLACKLIST", []))
+
+    # --- Indicator settings ---
+    RSI_LENGTH = _get_int("RSI_LENGTH", 14)
+    FAST_MA    = _get_int("FAST_MA", 60)
+    SLOW_MA    = _get_int("SLOW_MA", 240)
+
+    # --- Order sizing ---
+    ORDER_SIZE_MODE = os.getenv("ORDER_SIZE_MODE", "USD")    # "USD" or "PCT"
+    ORDER_SIZE_USD  = _get_float("ORDER_SIZE_USD", 20.0)
+    ORDER_SIZE_PCT  = _get_float("ORDER_SIZE_PCT", 0.05)     # 5% of free quote
+
+    # --- Profit taking ---
+    TAKE_PROFIT_PCT = _get_float("TAKE_PROFIT_PCT", 0.10)    # 10%
+
+    # --- Profit sink ---
+    PROFIT_SINK_SYMBOL = os.getenv("PROFIT_SINK_SYMBOL", "ATOM")
+    ENABLE_STAKING     = _get_bool("ENABLE_STAKING", False)
+
+    # --- Execution / dry-run ---
+    DRY_RUN = _get_bool("DRY_RUN", True)
+
+    # --- Loop / pacing ---
+    LOOP_SLEEP_SECONDS = _get_int("LOOP_SLEEP_SECONDS", 60)
+    PER_SYMBOL_DELAY_S = _get_int("PER_SYMBOL_DELAY_S", 0)
+
+    # --- Fees & backtest defaults (not used in live flow) ---
+    TAKER_FEE_PCT      = _get_float("TAKER_FEE_PCT", 0.001)  # 0.10%
+    MIN_NOTIONAL       = _get_float("MIN_NOTIONAL", 5.0)
+    BACKTEST_SEED_CASH = _get_float("BACKTEST_SEED_CASH", 10_000.0)
+
+    # --- Moonshot mode (partial take-profit) ---
+    ENABLE_MOONSHOT = _get_bool("ENABLE_MOONSHOT", False)
+    MOONSHOT_SELL_FRACTION = _get_float("MOONSHOT_SELL_FRACTION", 0.70)
+
+SETTINGS = Settings()
+
+
+# -------------------------
+# DB models (from db.py)
+# -------------------------
+Base = declarative_base()
+engine = create_engine(SETTINGS.DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+class SeenMarket(Base):
+    __tablename__ = "seen_markets"
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String, unique=True, index=True)
+    base = Column(String, index=True)
+    quote = Column(String, index=True)
+    first_seen = Column(DateTime, server_default=func.now())
+
+class Position(Base):
+    __tablename__ = "positions"
+    id = Column(Integer, primary_key=True)
+    base = Column(String, index=True)
+    quote = Column(String, index=True)
+    amount = Column(Float)             # base amount currently held (from our buys)
+    avg_cost = Column(Float)           # in quote (e.g., USD per base)
+    last_updated = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    __table_args__ = (UniqueConstraint("base", "quote", name="uix_base_quote"),)
+
+class BuyLock(Base):
+    __tablename__ = "buy_locks"
+    id = Column(Integer, primary_key=True)
+    base = Column(String, index=True)
+    active = Column(Boolean, default=True)  # ensures only one active buy at a time per asset
+    __table_args__ = (UniqueConstraint("base", name="uix_buylock_base"),)
+
+class TradeLog(Base):
+    __tablename__ = "trades"
+    id = Column(Integer, primary_key=True)
+    side = Column(String)              # BUY/SELL
+    symbol = Column(String)
+    base = Column(String)
+    quote = Column(String)
+    price = Column(Float)
+    amount = Column(Float)
+    notional = Column(Float)
+    pnl = Column(Float, nullable=True) # for sells
+    ts = Column(DateTime, server_default=func.now())
+
+def init_db():
+    Base.metadata.create_all(engine)
+
+
+# -------------------------
+# Exchange wrapper (from exchange_ccxt.py)
+# -------------------------
+class KrakenClient:
+    def __init__(self):
+        self.x = ccxt.kraken({
+            'apiKey': SETTINGS.KRAKEN_API_KEY,
+            'secret': SETTINGS.KRAKEN_API_SECRET,
+            'enableRateLimit': True,
+            'options': {'fetchOHLCVWarning': False}
+        })
+
+    def load_markets(self) -> Dict:
+        return self.x.load_markets(reload=True)
+
+    def _is_xstock(self, base: str) -> bool:
+        if not base:
+            return False
+        if base.lower().endswith(SETTINGS.XSTOCKS_SUFFIX.lower()):
+            return True
+        if base.upper() in SETTINGS.XSTOCKS_BASES:
+            return True
+        return False
+
+    def list_screenable_symbols(self) -> List[Tuple[str, str, str]]:
+        mkts = self.load_markets()
+        out: List[Tuple[str, str, str]] = []
+        for sym, m in mkts.items():
+            base = m.get('base')
+            quote = m.get('quote')
+            if not base or not quote:
+                continue
+            if quote not in SETTINGS.QUOTE_ASSETS:
+                continue
+            if not m.get('active', True):
+                continue
+            # Optional blacklist/guardrails
+            if base in SETTINGS.BASE_BLACKLIST:
+                continue
+
+            is_x = self._is_xstock(base)
+
+            if SETTINGS.XSTOCKS_ONLY:
+                if SETTINGS.INCLUDE_XSTOCKS and is_x:
+                    out.append((sym, base, quote))
+                continue
+
+            if is_x and SETTINGS.INCLUDE_XSTOCKS:
+                out.append((sym, base, quote))
+            elif (not is_x) and SETTINGS.INCLUDE_CRYPTO:
+                out.append((sym, base, quote))
+        return out
+
+    def fetch_ohlcv_df(self, symbol: str, timeframe: str = '15m', limit: int = 300) -> pd.DataFrame:
+        ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        return df
+
+    def fetch_ticker_price(self, symbol: str) -> float:
+        t = self.x.fetch_ticker(symbol)
+        return float(t['last'])
+
+    def get_free_balance(self, currency: str) -> float:
+        try:
+            bal = self.x.fetch_free_balance()
+            return float(bal.get(currency, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def market_buy_quote(self, symbol: str, quote_notional: float) -> Tuple[float, float]:
+        """
+        Market buy spending 'quote_notional' units of the QUOTE currency (USD/USDT).
+        Returns (price, base_qty).
+        """
+        price = self.fetch_ticker_price(symbol)
+        base_qty = quote_notional / price if price > 0 else 0.0
+        if SETTINGS.DRY_RUN:
+            return price, base_qty
+        self.x.create_order(symbol, type='market', side='buy', amount=base_qty)
+        return price, base_qty
+
+    # Back-compat shim
+    def market_buy_usd(self, symbol: str, usd_amount: float):
+        return self.market_buy_quote(symbol, usd_amount)
+
+    def market_sell_all(self, symbol: str, base_qty: float) -> Tuple[float, float]:
+        price = self.fetch_ticker_price(symbol)
+        if SETTINGS.DRY_RUN:
+            return price, base_qty
+        self.x.create_order(symbol, type='market', side='sell', amount=base_qty)
+        return price, base_qty
+
+    def buy_atom_for_usd(self, usd_amount: float) -> Tuple[float, float]:
+        # Prefer USD quote if available, else USDT
+        for q in SETTINGS.QUOTE_ASSETS:
+            sym = f"{SETTINGS.PROFIT_SINK_SYMBOL}/{q}"
+            try:
+                return self.market_buy_quote(sym, usd_amount)
+            except Exception:
+                continue
+        raise RuntimeError("No ATOM/* market available for quotes: " + ",".join(SETTINGS.QUOTE_ASSETS))
+
+    def stake_atom(self, base_qty: float) -> None:
+        # Placeholder: Kraken Earn/Equities staking endpoints aren’t available via CCXT.
+        pass
+
+
+# -------------------------
+# Indicators & signals (from strategy.py)
+# -------------------------
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
+
+def moving_average(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window=window, min_periods=window).mean()
+
+def compute_indicators(df: pd.DataFrame, rsi_len: int, fast: int, slow: int) -> pd.DataFrame:
+    out = df.copy()
+    out['rsi'] = rsi(out['close'], rsi_len)
+    out['ma_fast'] = moving_average(out['close'], fast)
+    out['ma_slow'] = moving_average(out['close'], slow)
+    return out
+
+def buy_signal(row) -> bool:
+    return (row['rsi'] <= 30) and (row['ma_fast'] < row['ma_slow'])
+
+
+# -------------------------
+# Orchestration (from main.py)
+# -------------------------
 @contextmanager
 def session_scope():
     s = SessionLocal()
@@ -23,12 +304,9 @@ def session_scope():
 
 def validate_settings():
     assert SETTINGS.FAST_MA < SETTINGS.SLOW_MA, "FAST_MA must be < SLOW_MA"
-    # Optional moonshot controls (safe defaults)
     if getattr(SETTINGS, "ENABLE_MOONSHOT", False):
         frac = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7))
         assert 0.0 < frac < 1.0, "MOONSHOT_SELL_FRACTION must be in (0,1)"
-
-# --- NEW: order sizing helper ---
 
 def compute_order_notional(kr: KrakenClient, quote: str) -> float:
     """
@@ -41,10 +319,7 @@ def compute_order_notional(kr: KrakenClient, quote: str) -> float:
         avail = kr.get_free_balance(quote)
         spend = max(0.0, avail * SETTINGS.ORDER_SIZE_PCT)
         return spend
-    # default: fixed spend
     return SETTINGS.ORDER_SIZE_USD
-
-# --- bootstrap + new-market detection ----------------------------------------
 
 def seed_markets_if_empty(kr: KrakenClient) -> bool:
     """
@@ -61,7 +336,6 @@ def seed_markets_if_empty(kr: KrakenClient) -> bool:
     print(f"Bootstrap: seeded {len(syms)} markets — no buys on first run.")
     return True
 
-
 def find_new_markets(kr: KrakenClient):
     """
     Return only markets that are NOT in seen_markets yet (true new listings since last run).
@@ -74,8 +348,6 @@ def find_new_markets(kr: KrakenClient):
                 s.add(SeenMarket(symbol=sym, base=base, quote=quote))
                 new_symbols.append((sym, base, quote))
     return new_symbols
-# -----------------------------------------------------------------------------
-
 
 def buy_new_listings(kr: KrakenClient, new_symbols):
     for sym, base, quote in new_symbols:
@@ -101,7 +373,6 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
             print(f"New listing buy: {sym} spend={order_notional:.2f} {quote} at {price:.6f}")
         except Exception as e:
             print(f"Failed new-listing buy for {sym}: {e}")
-
 
 def screen_and_buy_signals(kr: KrakenClient):
     syms = kr.list_screenable_symbols()
@@ -134,7 +405,6 @@ def screen_and_buy_signals(kr: KrakenClient):
                         s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
                     s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
                                    price=price, amount=qty, notional=price * qty))
-                # clarified logging
                 ma_fast = float(last['ma_fast'])
                 ma_slow = float(last['ma_slow'])
                 print(
@@ -145,7 +415,6 @@ def screen_and_buy_signals(kr: KrakenClient):
         except Exception as e:
             print(f"Screening error {sym}: {e}")
 
-
 def take_profits_and_sink(kr: KrakenClient):
     """
     SELL RULE (all must be true):
@@ -154,7 +423,7 @@ def take_profits_and_sink(kr: KrakenClient):
       - Price >= avg_cost * (1 + TAKE_PROFIT_PCT)
     Never sell ATOM (profit sink asset).
 
-    NEW: If ENABLE_MOONSHOT is True, when take-profit triggers we sell only a fraction
+    If ENABLE_MOONSHOT is True, when take-profit triggers we sell only a fraction
     (MOONSHOT_SELL_FRACTION) and keep the remainder to potentially ride a moonshot.
     BuyLock remains active while any position remains.
     """
@@ -168,7 +437,6 @@ def take_profits_and_sink(kr: KrakenClient):
 
             sym = f"{pos.base}/{pos.quote}"
             try:
-                # Need indicators to decide; fetch candles and compute
                 df = kr.fetch_ohlcv_df(sym, timeframe='15m',
                                        limit=max(SETTINGS.SLOW_MA + 5, 260))
                 ind = compute_indicators(df, SETTINGS.RSI_LENGTH,
@@ -186,22 +454,17 @@ def take_profits_and_sink(kr: KrakenClient):
             cond_ma = ma_fast > ma_slow
             target_price = pos.avg_cost * (1.0 + SETTINGS.TAKE_PROFIT_PCT)
             cond_profit = price >= target_price
-
             should_take_profit = cond_rsi and cond_ma and cond_profit
 
             if should_take_profit:
-                # Decide full vs partial exit
                 enable_moonshot = bool(getattr(SETTINGS, "ENABLE_MOONSHOT", False))
                 sell_fraction = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7)) if enable_moonshot else 1.0
                 sell_fraction = min(max(sell_fraction, 0.0), 1.0)
 
                 sell_qty = pos.amount * sell_fraction
-                # Ensure we don't leave dust below minimal tradable size unintentionally
                 if sell_fraction < 1.0 and sell_qty <= 0:
-                    # nothing meaningful to sell
                     continue
 
-                # Execute the sale of the chosen fraction
                 sell_price, actually_sold = kr.market_sell_all(sym, sell_qty)
                 notional = sell_price * actually_sold
                 cost = pos.avg_cost * actually_sold
@@ -214,7 +477,6 @@ def take_profits_and_sink(kr: KrakenClient):
 
                 remaining = pos.amount - actually_sold
                 if remaining <= 0:
-                    # Full exit path — clear position and its buy-lock
                     s.delete(pos)
                     bl = s.query(BuyLock).filter_by(base=pos.base, active=True).first()
                     if bl:
@@ -226,21 +488,12 @@ def take_profits_and_sink(kr: KrakenClient):
                         f"+{profit_pct:.2f}%), pnl≈{pnl:.2f}"
                     )
                 else:
-                    # Partial exit path — keep position and lock active, update avg_cost if desired
-                    # We keep avg_cost unchanged (reflects original cost of remaining units).
                     pos.amount = remaining
-                    # Keep BuyLock active so we don't pyramid while moonshot is open
                     print(
                         f"PARTIAL SELL {sym}: sold={actually_sold:.6f}, remain={remaining:.6f}, "
                         f"pnl≈{pnl:.2f}. Moonshot portion left to run."
                     )
-            else:
-                # Optional debug:
-                # print(f"Hold {sym}: rsi={rsi_val:.1f}, ma{SETTINGS.FAST_MA}={ma_fast:.6f}, ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, "
-                #       f"price={price:.6f}, target≥{target_price:.6f}")
-                pass
 
-    # Sink realized USD profits into ATOM
     if total_profit_usd > 0.0:
         try:
             price, qty = kr.buy_atom_for_usd(total_profit_usd)
@@ -251,16 +504,12 @@ def take_profits_and_sink(kr: KrakenClient):
         except Exception as e:
             print(f"Failed profit sink buy ATOM: {e}")
 
-
 def run_once():
     validate_settings()
     init_db()
     kr = KrakenClient()
 
-    # First-ever run: seed the market list and do NOT buy.
     bootstrapped = seed_markets_if_empty(kr)
-
-    # On subsequent runs: only these are truly new listings.
     new_syms = find_new_markets(kr)
 
     if (not bootstrapped) and new_syms:
@@ -269,10 +518,9 @@ def run_once():
     screen_and_buy_signals(kr)
     take_profits_and_sink(kr)
 
-
 if __name__ == "__main__":
     run_once()
-    # Uncomment for continuous loop mode:
+    # Uncomment to loop:
     # import time
     # while True:
     #     try:
