@@ -1,8 +1,6 @@
 # =============================
-# main.py (all-in-one)
+# main.py (all-in-one, no blacklisting, auto-bump to exchange minimums)
 # =============================
-# Orchestrates screening, trading, selling, and profit sink on Kraken via CCXT.
-# Combines settings, db models, exchange wrapper, indicators, and runner.
 
 import os
 from contextlib import contextmanager
@@ -19,7 +17,7 @@ from sqlalchemy.sql import func
 
 
 # -------------------------
-# Settings (from settings.py)
+# Settings
 # -------------------------
 def _get_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -63,7 +61,7 @@ class Settings:
     XSTOCKS_SUFFIX = os.getenv("XSTOCKS_SUFFIX", "x")        # e.g., "AAPLx"
     XSTOCKS_BASES  = set(_get_csv("XSTOCKS_BASES", []))      # explicit whitelist as xStocks
 
-    # Optional guardrails (unused in core flow but safe to keep)
+    # Optional guardrails (not enforced by core flow)
     MIN_24H_VOLUME = _get_float("MIN_24H_VOLUME", 0.0)
     BASE_BLACKLIST = set(_get_csv("BASE_BLACKLIST", []))
 
@@ -91,7 +89,7 @@ class Settings:
     LOOP_SLEEP_SECONDS = _get_int("LOOP_SLEEP_SECONDS", 60)
     PER_SYMBOL_DELAY_S = _get_int("PER_SYMBOL_DELAY_S", 0)
 
-    # --- Fees & backtest defaults (not used in live flow) ---
+    # --- Misc defaults (not used in live flow) ---
     TAKER_FEE_PCT      = _get_float("TAKER_FEE_PCT", 0.001)  # 0.10%
     MIN_NOTIONAL       = _get_float("MIN_NOTIONAL", 5.0)
     BACKTEST_SEED_CASH = _get_float("BACKTEST_SEED_CASH", 10_000.0)
@@ -104,7 +102,7 @@ SETTINGS = Settings()
 
 
 # -------------------------
-# DB models (from db.py)
+# DB models
 # -------------------------
 Base = declarative_base()
 engine = create_engine(SETTINGS.DATABASE_URL, echo=False)
@@ -123,7 +121,7 @@ class Position(Base):
     id = Column(Integer, primary_key=True)
     base = Column(String, index=True)
     quote = Column(String, index=True)
-    amount = Column(Float)             # base amount currently held (from our buys)
+    amount = Column(Float)             # base amount held
     avg_cost = Column(Float)           # in quote (e.g., USD per base)
     last_updated = Column(DateTime, server_default=func.now(), onupdate=func.now())
     __table_args__ = (UniqueConstraint("base", "quote", name="uix_base_quote"),)
@@ -132,7 +130,7 @@ class BuyLock(Base):
     __tablename__ = "buy_locks"
     id = Column(Integer, primary_key=True)
     base = Column(String, index=True)
-    active = Column(Boolean, default=True)  # ensures only one active buy at a time per asset
+    active = Column(Boolean, default=True)  # one active buy at a time per base
     __table_args__ = (UniqueConstraint("base", name="uix_buylock_base"),)
 
 class TradeLog(Base):
@@ -153,7 +151,7 @@ def init_db():
 
 
 # -------------------------
-# Exchange wrapper (from exchange_ccxt.py)
+# Exchange wrapper
 # -------------------------
 class KrakenClient:
     def __init__(self):
@@ -166,6 +164,21 @@ class KrakenClient:
 
     def load_markets(self) -> Dict:
         return self.x.load_markets(reload=True)
+
+    def get_market(self, symbol: str) -> dict:
+        markets = self.x.load_markets()
+        return markets.get(symbol, {})
+
+    def get_min_cost_and_amount(self, symbol: str) -> Tuple[float, float]:
+        """
+        Returns (min_cost, min_amount) if provided by exchange metadata, else (None, None).
+        """
+        m = self.get_market(symbol) or {}
+        limits = m.get('limits') or {}
+        cost_min = (limits.get('cost') or {}).get('min')
+        amount_min = (limits.get('amount') or {}).get('min')
+        return (float(cost_min) if cost_min is not None else None,
+                float(amount_min) if amount_min is not None else None)
 
     def _is_xstock(self, base: str) -> bool:
         if not base:
@@ -188,12 +201,10 @@ class KrakenClient:
                 continue
             if not m.get('active', True):
                 continue
-            # Optional blacklist/guardrails
             if base in SETTINGS.BASE_BLACKLIST:
                 continue
 
             is_x = self._is_xstock(base)
-
             if SETTINGS.XSTOCKS_ONLY:
                 if SETTINGS.INCLUDE_XSTOCKS and is_x:
                     out.append((sym, base, quote))
@@ -234,10 +245,6 @@ class KrakenClient:
         self.x.create_order(symbol, type='market', side='buy', amount=base_qty)
         return price, base_qty
 
-    # Back-compat shim
-    def market_buy_usd(self, symbol: str, usd_amount: float):
-        return self.market_buy_quote(symbol, usd_amount)
-
     def market_sell_all(self, symbol: str, base_qty: float) -> Tuple[float, float]:
         price = self.fetch_ticker_price(symbol)
         if SETTINGS.DRY_RUN:
@@ -261,7 +268,7 @@ class KrakenClient:
 
 
 # -------------------------
-# Indicators & signals (from strategy.py)
+# Indicators & signals
 # -------------------------
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
@@ -288,8 +295,36 @@ def buy_signal(row) -> bool:
 
 
 # -------------------------
-# Orchestration (from main.py)
+# Orchestration helpers
 # -------------------------
+BaseBumpBuffer = 1.01  # bump 1% above calculated minimum to avoid boundary rejects
+
+def bump_spend_to_exchange_minimums(kr: KrakenClient, symbol: str, desired_spend: float, buffer: float = BaseBumpBuffer) -> Tuple[float, bool]:
+    """
+    Ensure spend meets exchange minimums. Returns (adjusted_spend, bumped_flag).
+    If exchange defines min cost or min amount, we raise spend accordingly and add a small buffer.
+    """
+    if desired_spend <= 0:
+        return 0.0, False
+
+    min_cost, min_amount = kr.get_min_cost_and_amount(symbol)
+    price = 0.0
+    try:
+        price = kr.fetch_ticker_price(symbol)
+    except Exception:
+        pass
+
+    required_spend = desired_spend
+    if min_cost is not None:
+        required_spend = max(required_spend, float(min_cost))
+    if min_amount is not None and price and price > 0:
+        required_spend = max(required_spend, float(min_amount) * price)
+
+    if required_spend > desired_spend + 1e-12:
+        return required_spend * (buffer if buffer > 1.0 else 1.0), True
+    return desired_spend, False
+
+
 @contextmanager
 def session_scope():
     s = SessionLocal()
@@ -353,9 +388,11 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
     for sym, base, quote in new_symbols:
         try:
             order_notional = compute_order_notional(kr, quote)
-            if order_notional <= 0:
-                print(f"Skip new-listing buy {sym}: no available {quote} balance")
-                continue
+            bumped, was_bumped = bump_spend_to_exchange_minimums(kr, sym, order_notional)
+            if was_bumped:
+                print(f"{sym}: bumped spend {order_notional:.2f} -> {bumped:.2f} {quote} to satisfy exchange minimums")
+            order_notional = bumped
+
             price, qty = kr.market_buy_quote(sym, order_notional)
             with session_scope() as s:
                 if not s.query(BuyLock).filter_by(base=base).first():
@@ -372,12 +409,13 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
                                price=price, amount=qty, notional=price * qty))
             print(f"New listing buy: {sym} spend={order_notional:.2f} {quote} at {price:.6f}")
         except Exception as e:
-            print(f"Failed new-listing buy for {sym}: {e}")
+            # Log and continue; do NOT blacklist restricted assets
+            print(f"Buy error {sym}: {e}")
 
 def screen_and_buy_signals(kr: KrakenClient):
     syms = kr.list_screenable_symbols()
     for sym, base, quote in syms:
-        # Only one active buy per base asset at a time
+        # Only one active buy per base at a time
         with session_scope() as s:
             if s.query(BuyLock).filter_by(base=base, active=True).first():
                 continue
@@ -389,9 +427,11 @@ def screen_and_buy_signals(kr: KrakenClient):
             last = ind.iloc[-1]
             if buy_signal(last):
                 order_notional = compute_order_notional(kr, quote)
-                if order_notional <= 0:
-                    print(f"Skip signal buy {sym}: no available {quote} balance")
-                    continue
+                bumped, was_bumped = bump_spend_to_exchange_minimums(kr, sym, order_notional)
+                if was_bumped:
+                    print(f"{sym}: bumped spend {order_notional:.2f} -> {bumped:.2f} {quote} to satisfy exchange minimums")
+                order_notional = bumped
+
                 price, qty = kr.market_buy_quote(sym, order_notional)
                 with session_scope() as s:
                     s.add(BuyLock(base=base, active=True))
@@ -413,6 +453,7 @@ def screen_and_buy_signals(kr: KrakenClient):
                     f"spend={order_notional:.2f} {quote}"
                 )
         except Exception as e:
+            # This will include permission errors; we just log them and move on
             print(f"Screening error {sym}: {e}")
 
 def take_profits_and_sink(kr: KrakenClient):
@@ -422,16 +463,12 @@ def take_profits_and_sink(kr: KrakenClient):
       - MA60 > MA240  (15m bars)
       - Price >= avg_cost * (1 + TAKE_PROFIT_PCT)
     Never sell ATOM (profit sink asset).
-
-    If ENABLE_MOONSHOT is True, when take-profit triggers we sell only a fraction
-    (MOONSHOT_SELL_FRACTION) and keep the remainder to potentially ride a moonshot.
-    BuyLock remains active while any position remains.
+    If ENABLE_MOONSHOT, sell only a fraction and keep remainder.
     """
     total_profit_usd = 0.0
     with session_scope() as s:
         positions = s.query(Position).all()
         for pos in positions:
-            # Never sell ATOM
             if pos.base == SETTINGS.PROFIT_SINK_SYMBOL:
                 continue
 
