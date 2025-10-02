@@ -1,10 +1,11 @@
 # =============================
-# main.py (all-in-one, no blacklisting, auto-bump to exchange minimums)
+# main.py (all-in-one, no blacklisting, auto-bump for min cost/amount AND amount precision)
 # =============================
 
 import os
+import math
 from contextlib import contextmanager
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import pandas as pd
 import ccxt
@@ -166,19 +167,41 @@ class KrakenClient:
         return self.x.load_markets(reload=True)
 
     def get_market(self, symbol: str) -> dict:
-        markets = self.x.load_markets()
+        markets = self.x.load_markets()  # cached
         return markets.get(symbol, {})
 
-    def get_min_cost_and_amount(self, symbol: str) -> Tuple[float, float]:
+    def get_min_cost_amount_step(self, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
-        Returns (min_cost, min_amount) if provided by exchange metadata, else (None, None).
+        Returns (min_cost, min_amount, amount_step).
+        - min_cost: minimum quote notional
+        - min_amount: minimum base amount
+        - amount_step: smallest increment in base amount (derived from precision or explicit step)
         """
         m = self.get_market(symbol) or {}
         limits = m.get('limits') or {}
         cost_min = (limits.get('cost') or {}).get('min')
         amount_min = (limits.get('amount') or {}).get('min')
-        return (float(cost_min) if cost_min is not None else None,
-                float(amount_min) if amount_min is not None else None)
+
+        # Derive an amount step:
+        step = None
+        # Some exchanges expose 'precision' as decimal places (int). For Kraken, this is usually decimals.
+        prec = (m.get('precision') or {}).get('amount')
+        if isinstance(prec, (int, float)):
+            try:
+                # If prec is decimals, step = 10^-prec
+                step = pow(10.0, -float(prec))
+            except Exception:
+                step = None
+        # If CCXT exposes a direct step in limits.amount.step, prefer it
+        step_direct = (limits.get('amount') or {}).get('step') if limits.get('amount') else None
+        if step_direct is not None:
+            step = float(step_direct)
+
+        return (
+            float(cost_min) if cost_min is not None else None,
+            float(amount_min) if amount_min is not None else None,
+            float(step) if step is not None else None,
+        )
 
     def _is_xstock(self, base: str) -> bool:
         if not base:
@@ -233,19 +256,69 @@ class KrakenClient:
         except Exception:
             return 0.0
 
+    def _amount_to_precision_ceil(self, symbol: str, amount: float, step: Optional[float]) -> float:
+        """
+        Convert amount to a valid tradable amount, rounding UP to the next step if needed.
+        Uses CCXT's amount_to_precision to enforce decimal places, then adjusts upward
+        to meet a known step if provided.
+        """
+        if amount <= 0:
+            return 0.0
+        # First adhere to decimal precision CCXT expects
+        try:
+            amt_str = self.x.amount_to_precision(symbol, amount)
+            amt = float(amt_str)
+        except Exception:
+            amt = amount
+
+        if step and step > 0:
+            # ceil to next multiple of 'step'
+            multiples = math.ceil(amt / step)
+            amt = multiples * step
+            # Re-apply precision formatting after stepping
+            try:
+                amt_str = self.x.amount_to_precision(symbol, amt)
+                amt = float(amt_str)
+            except Exception:
+                pass
+        return amt
+
     def market_buy_quote(self, symbol: str, quote_notional: float) -> Tuple[float, float]:
         """
         Market buy spending 'quote_notional' units of the QUOTE currency (USD/USDT).
-        Returns (price, base_qty).
+        Returns (price, base_qty) actually requested.
         """
         price = self.fetch_ticker_price(symbol)
         base_qty = quote_notional / price if price > 0 else 0.0
+
+        # Enforce precision/step by rounding UP
+        _, min_amount, amount_step = self.get_min_cost_amount_step(symbol)
+        base_qty = self._amount_to_precision_ceil(symbol, base_qty, amount_step)
+
         if SETTINGS.DRY_RUN:
             return price, base_qty
+
         self.x.create_order(symbol, type='market', side='buy', amount=base_qty)
         return price, base_qty
 
     def market_sell_all(self, symbol: str, base_qty: float) -> Tuple[float, float]:
+        # For sells, round DOWN a hair to avoid “too much” errors, but still respect precision
+        _, _, amount_step = self.get_min_cost_amount_step(symbol)
+        try:
+            amt_str = self.x.amount_to_precision(symbol, base_qty)
+            base_qty = float(amt_str)
+        except Exception:
+            pass
+        if amount_step and amount_step > 0:
+            # floor to step
+            multiples = math.floor(base_qty / amount_step)
+            base_qty = multiples * amount_step
+            try:
+                amt_str = self.x.amount_to_precision(symbol, base_qty)
+                base_qty = float(amt_str)
+            except Exception:
+                pass
+
         price = self.fetch_ticker_price(symbol)
         if SETTINGS.DRY_RUN:
             return price, base_qty
@@ -297,32 +370,55 @@ def buy_signal(row) -> bool:
 # -------------------------
 # Orchestration helpers
 # -------------------------
-BaseBumpBuffer = 1.01  # bump 1% above calculated minimum to avoid boundary rejects
+BUMP_BUFFER = 1.01  # 1% safety buffer above calculated minimums
 
-def bump_spend_to_exchange_minimums(kr: KrakenClient, symbol: str, desired_spend: float, buffer: float = BaseBumpBuffer) -> Tuple[float, bool]:
+def required_spend_for_amount(symbol: str, price: float, amount: float) -> float:
+    if price and price > 0:
+        return amount * price
+    return 0.0
+
+def bump_spend_to_exchange_minimums(kr: KrakenClient, symbol: str, desired_spend: float) -> Tuple[float, bool]:
     """
-    Ensure spend meets exchange minimums. Returns (adjusted_spend, bumped_flag).
-    If exchange defines min cost or min amount, we raise spend accordingly and add a small buffer.
+    Bump spend to satisfy:
+      - min cost (quote notional)
+      - min amount (base)
+      - amount step/precision (by rounding UP to next valid step)
+    Returns (adjusted_spend, was_bumped)
     """
     if desired_spend <= 0:
         return 0.0, False
 
-    min_cost, min_amount = kr.get_min_cost_and_amount(symbol)
-    price = 0.0
+    min_cost, min_amount, amount_step = kr.get_min_cost_amount_step(symbol)
     try:
         price = kr.fetch_ticker_price(symbol)
     except Exception:
-        pass
+        price = 0.0
 
-    required_spend = desired_spend
+    adjusted = desired_spend
+
+    # Ensure spend meets min cost
     if min_cost is not None:
-        required_spend = max(required_spend, float(min_cost))
-    if min_amount is not None and price and price > 0:
-        required_spend = max(required_spend, float(min_amount) * price)
+        adjusted = max(adjusted, float(min_cost))
 
-    if required_spend > desired_spend + 1e-12:
-        return required_spend * (buffer if buffer > 1.0 else 1.0), True
-    return desired_spend, False
+    # Ensure base amount meets min amount and step after rounding UP
+    if price and price > 0:
+        # target base amount from current spend
+        base_qty = adjusted / price
+
+        # apply min amount if any
+        if (min_amount is not None) and (base_qty < float(min_amount) - 1e-18):
+            base_qty = float(min_amount)
+
+        # apply step: round UP to next valid increment
+        if amount_step and amount_step > 0:
+            base_qty = math.ceil(base_qty / amount_step) * amount_step
+
+        # re-compute spend from the rounded/stepped amount
+        adjusted = required_spend_for_amount(symbol, price, base_qty)
+
+    # Add tiny buffer to avoid boundary rejects
+    adjusted *= BUMP_BUFFER
+    return adjusted, (adjusted > desired_spend + 1e-12)
 
 
 @contextmanager
@@ -387,13 +483,12 @@ def find_new_markets(kr: KrakenClient):
 def buy_new_listings(kr: KrakenClient, new_symbols):
     for sym, base, quote in new_symbols:
         try:
-            order_notional = compute_order_notional(kr, quote)
-            bumped, was_bumped = bump_spend_to_exchange_minimums(kr, sym, order_notional)
-            if was_bumped:
-                print(f"{sym}: bumped spend {order_notional:.2f} -> {bumped:.2f} {quote} to satisfy exchange minimums")
-            order_notional = bumped
+            desired = compute_order_notional(kr, quote)
+            adjusted, bumped = bump_spend_to_exchange_minimums(kr, sym, desired)
+            if bumped:
+                print(f"{sym}: bumped spend {desired:.8f} -> {adjusted:.8f} {quote} (min cost/amount/precision)")
 
-            price, qty = kr.market_buy_quote(sym, order_notional)
+            price, qty = kr.market_buy_quote(sym, adjusted)
             with session_scope() as s:
                 if not s.query(BuyLock).filter_by(base=base).first():
                     s.add(BuyLock(base=base, active=True))
@@ -407,9 +502,8 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
                     s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
                 s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
                                price=price, amount=qty, notional=price * qty))
-            print(f"New listing buy: {sym} spend={order_notional:.2f} {quote} at {price:.6f}")
+            print(f"New listing buy: {sym} spend={adjusted:.8f} {quote} at {price:.10f}")
         except Exception as e:
-            # Log and continue; do NOT blacklist restricted assets
             print(f"Buy error {sym}: {e}")
 
 def screen_and_buy_signals(kr: KrakenClient):
@@ -426,13 +520,12 @@ def screen_and_buy_signals(kr: KrakenClient):
                                      SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
             last = ind.iloc[-1]
             if buy_signal(last):
-                order_notional = compute_order_notional(kr, quote)
-                bumped, was_bumped = bump_spend_to_exchange_minimums(kr, sym, order_notional)
-                if was_bumped:
-                    print(f"{sym}: bumped spend {order_notional:.2f} -> {bumped:.2f} {quote} to satisfy exchange minimums")
-                order_notional = bumped
+                desired = compute_order_notional(kr, quote)
+                adjusted, bumped = bump_spend_to_exchange_minimums(kr, sym, desired)
+                if bumped:
+                    print(f"{sym}: bumped spend {desired:.8f} -> {adjusted:.8f} {quote} (min cost/amount/precision)")
 
-                price, qty = kr.market_buy_quote(sym, order_notional)
+                price, qty = kr.market_buy_quote(sym, adjusted)
                 with session_scope() as s:
                     s.add(BuyLock(base=base, active=True))
                     pos = s.query(Position).filter_by(base=base, quote=quote).first()
@@ -449,11 +542,11 @@ def screen_and_buy_signals(kr: KrakenClient):
                 ma_slow = float(last['ma_slow'])
                 print(
                     f"Signal BUY {sym}: rsi={last['rsi']:.1f}, "
-                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} > ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={price:.6f}, "
-                    f"spend={order_notional:.2f} {quote}"
+                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} > ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={price:.10f}, "
+                    f"spend={adjusted:.8f} {quote}"
                 )
         except Exception as e:
-            # This will include permission errors; we just log them and move on
+            # Permission errors and anything else are just logged—no blacklisting
             print(f"Screening error {sym}: {e}")
 
 def take_profits_and_sink(kr: KrakenClient):
@@ -521,20 +614,20 @@ def take_profits_and_sink(kr: KrakenClient):
                     profit_pct = (sell_price / pos.avg_cost - 1.0) * 100.0
                     print(
                         f"SELL {sym}: rsi={rsi_val:.1f} (>=70), ma{SETTINGS.FAST_MA}={ma_fast:.6f} > "
-                        f"ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={sell_price:.6f} (avg={pos.avg_cost:.6f}, "
+                        f"ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={sell_price:.10f} (avg={pos.avg_cost:.10f}, "
                         f"+{profit_pct:.2f}%), pnl≈{pnl:.2f}"
                     )
                 else:
                     pos.amount = remaining
                     print(
-                        f"PARTIAL SELL {sym}: sold={actually_sold:.6f}, remain={remaining:.6f}, "
+                        f"PARTIAL SELL {sym}: sold={actually_sold:.10f}, remain={remaining:.10f}, "
                         f"pnl≈{pnl:.2f}. Moonshot portion left to run."
                     )
 
     if total_profit_usd > 0.0:
         try:
             price, qty = kr.buy_atom_for_usd(total_profit_usd)
-            print(f"Profit sink: bought {qty:.6f} ATOM at {price:.6f} for ${total_profit_usd:.2f}")
+            print(f"Profit sink: bought {qty:.10f} ATOM at {price:.10f} for ${total_profit_usd:.2f}")
             if SETTINGS.ENABLE_STAKING:
                 kr.stake_atom(qty)  # placeholder
                 print("(Attempted to stake ATOM via placeholder—verify API support)")
