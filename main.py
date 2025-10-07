@@ -1,5 +1,5 @@
 # =============================
-# main.py (all-in-one, no blacklisting, auto-bump for min cost/amount AND amount precision)
+# main.py (tightened: no double-buys on held bases, safer signal, buylock sync)
 # =============================
 
 import os
@@ -98,6 +98,9 @@ class Settings:
     # --- Moonshot mode (partial take-profit) ---
     ENABLE_MOONSHOT = _get_bool("ENABLE_MOONSHOT", False)
     MOONSHOT_SELL_FRACTION = _get_float("MOONSHOT_SELL_FRACTION", 0.70)
+
+    # --- Safety cap for buys per run ---
+    MAX_BUYS_PER_RUN = _get_int("MAX_BUYS_PER_RUN", 3)
 
 SETTINGS = Settings()
 
@@ -363,8 +366,34 @@ def compute_indicators(df: pd.DataFrame, rsi_len: int, fast: int, slow: int) -> 
     out['ma_slow'] = moving_average(out['close'], slow)
     return out
 
-def buy_signal(row) -> bool:
+def buy_signal_rowwise(row) -> bool:
+    # kept for compatibility if needed elsewhere
     return (row['rsi'] <= 30) and (row['ma_fast'] < row['ma_slow'])
+
+def buy_signal_df(ind: pd.DataFrame) -> bool:
+    """
+    Tightened buy: oversold + bearish, but require early turn:
+      - RSI <= 30
+      - MA_fast < MA_slow (downtrend)
+      - RSI rising vs previous bar
+      - Close is a green bar vs previous close
+    """
+    if len(ind) < 2:
+        return False
+    last2 = ind.iloc[-2:]
+    rsi_now = float(last2['rsi'].iloc[-1])
+    rsi_prev = float(last2['rsi'].iloc[-2])
+    ma_fast_now = float(last2['ma_fast'].iloc[-1])
+    ma_slow_now = float(last2['ma_slow'].iloc[-1])
+    close_now = float(last2['close'].iloc[-1])
+    close_prev = float(last2['close'].iloc[-2])
+
+    return (
+        (rsi_now <= 30.0) and
+        (ma_fast_now < ma_slow_now) and
+        (rsi_now > rsi_prev) and
+        (close_now > close_prev)
+    )
 
 
 # -------------------------
@@ -481,8 +510,19 @@ def find_new_markets(kr: KrakenClient):
     return new_symbols
 
 def buy_new_listings(kr: KrakenClient, new_symbols):
+    buys_this_run = 0
     for sym, base, quote in new_symbols:
+        if buys_this_run >= SETTINGS.MAX_BUYS_PER_RUN:
+            break
         try:
+            # Hard skip if we already hold this base (any quote)
+            with session_scope() as s:
+                if s.query(Position).filter_by(base=base).first():
+                    # ensure a lock exists for legacy positions
+                    if not s.query(BuyLock).filter_by(base=base).first():
+                        s.add(BuyLock(base=base, active=True))
+                    continue
+
             desired = compute_order_notional(kr, quote)
             adjusted, bumped = bump_spend_to_exchange_minimums(kr, sym, desired)
             if bumped:
@@ -502,24 +542,34 @@ def buy_new_listings(kr: KrakenClient, new_symbols):
                     s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
                 s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
                                price=price, amount=qty, notional=price * qty))
+            buys_this_run += 1
             print(f"New listing buy: {sym} spend={adjusted:.8f} {quote} at {price:.10f}")
         except Exception as e:
             print(f"Buy error {sym}: {e}")
 
 def screen_and_buy_signals(kr: KrakenClient):
     syms = kr.list_screenable_symbols()
+    buys_this_run = 0
     for sym, base, quote in syms:
-        # Only one active buy per base at a time
+        if buys_this_run >= SETTINGS.MAX_BUYS_PER_RUN:
+            break
+
+        # Hard skip if we already hold this base OR we have an active lock
         with session_scope() as s:
+            if s.query(Position).filter_by(base=base).first():
+                # guarantee a lock exists for legacy positions
+                if not s.query(BuyLock).filter_by(base=base).first():
+                    s.add(BuyLock(base=base, active=True))
+                continue
             if s.query(BuyLock).filter_by(base=base, active=True).first():
                 continue
+
         try:
             df = kr.fetch_ohlcv_df(sym, timeframe='15m',
                                    limit=max(SETTINGS.SLOW_MA + 5, 260))
             ind = compute_indicators(df, SETTINGS.RSI_LENGTH,
                                      SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
-            last = ind.iloc[-1]
-            if buy_signal(last):
+            if buy_signal_df(ind):
                 desired = compute_order_notional(kr, quote)
                 adjusted, bumped = bump_spend_to_exchange_minimums(kr, sym, desired)
                 if bumped:
@@ -538,11 +588,14 @@ def screen_and_buy_signals(kr: KrakenClient):
                         s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
                     s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
                                    price=price, amount=qty, notional=price * qty))
+                buys_this_run += 1
+
+                last = ind.iloc[-1]
                 ma_fast = float(last['ma_fast'])
                 ma_slow = float(last['ma_slow'])
                 print(
-                    f"Signal BUY {sym}: rsi={last['rsi']:.1f}, "
-                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} > ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={price:.10f}, "
+                    f"Signal BUY {sym}: rsi={last['rsi']:.1f} (rising), "
+                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} < ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={price:.10f}, "
                     f"spend={adjusted:.8f} {quote}"
                 )
         except Exception as e:
@@ -634,10 +687,24 @@ def take_profits_and_sink(kr: KrakenClient):
         except Exception as e:
             print(f"Failed profit sink buy ATOM: {e}")
 
+def sync_buylocks_with_positions():
+    """
+    Ensure a BuyLock exists for every held base across any quote.
+    This prevents accidental additional buys if legacy runs lacked locks.
+    """
+    with session_scope() as s:
+        held_bases = {p.base for p in s.query(Position).all() if (p.amount or 0) > 0}
+        for b in held_bases:
+            if not s.query(BuyLock).filter_by(base=b).first():
+                s.add(BuyLock(base=b, active=True))
+
 def run_once():
     validate_settings()
     init_db()
     kr = KrakenClient()
+
+    # One-time sanity: guarantee locks for held positions
+    sync_buylocks_with_positions()
 
     bootstrapped = seed_markets_if_empty(kr)
     new_syms = find_new_markets(kr)
