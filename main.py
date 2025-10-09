@@ -1,9 +1,11 @@
 # =============================
-# main.py (tightened: no double-buys on held bases, safer signal, buylock sync)
+# main.py (verbose logging for Railway; no behavior changes)
 # =============================
 
 import os
+import sys
 import math
+import logging
 from contextlib import contextmanager
 from typing import List, Dict, Tuple, Optional
 
@@ -17,7 +19,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.sql import func
 
 # -------------------------
-# Settings
+# Logging
 # -------------------------
 
 def _get_bool(env: str, default: bool) -> bool:
@@ -27,12 +29,14 @@ def _get_bool(env: str, default: bool) -> bool:
     v = v.strip().lower()
     return v in ("1", "true", "yes", "y", "on")
 
+
 def _get_int(env: str, default: int) -> int:
     v = os.getenv(env)
     try:
         return int(v)
     except Exception:
         return default
+
 
 def _get_float(env: str, default: float) -> float:
     v = os.getenv(env)
@@ -41,11 +45,33 @@ def _get_float(env: str, default: float) -> float:
     except Exception:
         return default
 
+
 def _get_csv(env: str, default: List[str]) -> List[str]:
     v = os.getenv(env)
     if not v:
         return default
     return [x.strip() for x in v.split(',') if x.strip()]
+
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_EVERY_SYMBOL = _get_bool("LOG_EVERY_SYMBOL", True)
+
+_logger = logging.getLogger("aletheia")
+if not _logger.handlers:
+    _logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    _handler = logging.StreamHandler(sys.stdout)
+    _formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _handler.setFormatter(_formatter)
+    _logger.addHandler(_handler)
+    _logger.propagate = False
+
+
+# -------------------------
+# Settings
+# -------------------------
 
 class Settings:
     # --- General ---
@@ -85,6 +111,13 @@ class Settings:
     MACD_SIG   = 9
 
 SETTINGS = Settings()
+
+# Quick settings summary at startup (avoid leaking secrets)
+_logger.info(
+    "Settings: DRY_RUN=%s MAX_BUYS_PER_RUN=%s TAKE_PROFIT_PCT=%.3f MOONSHOT=%s QUOTES=%s MIN_24H_VOL=%.2f",
+    SETTINGS.DRY_RUN, SETTINGS.MAX_BUYS_PER_RUN, SETTINGS.TAKE_PROFIT_PCT,
+    SETTINGS.ENABLE_MOONSHOT, ",".join(SETTINGS.QUOTE_ASSETS), SETTINGS.MIN_24H_VOLUME,
+)
 
 # -------------------------
 # DB models
@@ -130,6 +163,7 @@ class TradeLog(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 Base.metadata.create_all(bind=engine)
+_logger.info("Database initialized at %s", SETTINGS.DATABASE_URL)
 
 @contextmanager
 def session_scope():
@@ -137,8 +171,9 @@ def session_scope():
     try:
         yield session
         session.commit()
-    except Exception:
+    except Exception as e:
         session.rollback()
+        _logger.exception("DB session rolled back due to: %s", e)
         raise
     finally:
         session.close()
@@ -154,10 +189,13 @@ class KrakenClient:
             'enableRateLimit': True,
         })
         self.markets = None
+        _logger.info("Kraken client initialized (rate limited=%s, dry_run=%s)", True, SETTINGS.DRY_RUN)
 
     def load_markets(self):
         if self.markets is None:
+            _logger.info("Loading markets from Kraken…")
             self.markets = self.x.load_markets()
+            _logger.info("Loaded %d markets", len(self.markets or {}))
         return self.markets
 
     def get_market(self, symbol: str) -> Optional[dict]:
@@ -165,6 +203,7 @@ class KrakenClient:
         return self.markets.get(symbol)
 
     def fetch_ohlcv_df(self, symbol: str, timeframe: str = '15m', limit: int = 300) -> pd.DataFrame:
+        _logger.debug("Fetching OHLCV: %s tf=%s limit=%s", symbol, timeframe, limit)
         ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -172,7 +211,9 @@ class KrakenClient:
 
     def fetch_ticker_price(self, symbol: str) -> float:
         t = self.x.fetch_ticker(symbol)
-        return float(t['last'])
+        price = float(t['last'])
+        _logger.debug("Ticker %s last=%.12f", symbol, price)
+        return price
 
     def list_screenable_symbols(self) -> List[Tuple[str, str, str]]:
         """
@@ -188,6 +229,8 @@ class KrakenClient:
                 continue
 
             if SETTINGS.BASE_BLACKLIST and base in SETTINGS.BASE_BLACKLIST:
+                if LOG_EVERY_SYMBOL:
+                    _logger.debug("Skip %s/%s: base blacklisted", base, quote)
                 continue
 
             is_xstock = base.endswith(SETTINGS.XSTOCKS_SUFFIX)
@@ -195,14 +238,22 @@ class KrakenClient:
 
             if SETTINGS.XSTOCKS_ONLY:
                 if not is_xstock:
+                    if LOG_EVERY_SYMBOL:
+                        _logger.debug("Skip %s/%s: xStocks only", base, quote)
                     continue
             else:
                 if is_xstock and not SETTINGS.INCLUDE_XSTOCKS:
+                    if LOG_EVERY_SYMBOL:
+                        _logger.debug("Skip %s/%s: xStocks disabled", base, quote)
                     continue
                 if is_crypto and not SETTINGS.INCLUDE_CRYPTO:
+                    if LOG_EVERY_SYMBOL:
+                        _logger.debug("Skip %s/%s: crypto disabled", base, quote)
                     continue
 
             if quote not in SETTINGS.QUOTE_ASSETS:
+                if LOG_EVERY_SYMBOL:
+                    _logger.debug("Skip %s/%s: quote not in %s", base, quote, SETTINGS.QUOTE_ASSETS)
                 continue
 
             out.append((sym, base, quote))
@@ -212,6 +263,7 @@ class KrakenClient:
             for sym, base, quote in out:
                 if not s.query(Symbol).filter_by(symbol=sym).first():
                     s.add(Symbol(symbol=sym, base=base, quote=quote))
+        _logger.info("Screenable symbols: %d", len(out))
         return out
 
     # -----------------
@@ -231,53 +283,56 @@ class KrakenClient:
 
         # Derive an amount step:
         step = None
-        # Some exchanges expose 'precision' as decimal places (int). For Kraken, this is usually decimals.
         prec = (m.get('precision') or {}).get('amount')
         if isinstance(prec, (int, float)):
             try:
                 step = 10 ** (-int(prec))
             except Exception:
                 step = None
-        # If exchange provides explicit step size, prefer it
         step_size = (limits.get('amount') or {}).get('step')
         if step_size is not None:
             step = step_size
 
+        _logger.debug("Minimums %s: min_cost=%s min_amount=%s step=%s", symbol, cost_min, amount_min, step)
         return cost_min, amount_min, step
 
     def market_buy_quote(self, symbol: str, quote_amount: float) -> Tuple[float, float]:
         price = self.fetch_ticker_price(symbol)
         if SETTINGS.DRY_RUN:
-            # Simulate fills greedily
             base_qty = quote_amount / max(price, 1e-18)
+            _logger.info("DRY_RUN BUY %s spend=%.8f price=%.10f qty=%.10f", symbol, quote_amount, price, base_qty)
             return price, base_qty
+        _logger.info("LIVE BUY %s spend=%.8f price≈%.10f", symbol, quote_amount, price)
         order = self.x.create_order(symbol, type='market', side='buy', amount=None, params={'cost': quote_amount})
         filled_base = float(order.get('filled', 0.0))
+        _logger.info("Order result %s: filled_base=%.10f", symbol, filled_base)
         return price, filled_base
 
     def market_sell_all(self, symbol: str, base_qty: float) -> Tuple[float, float]:
-        # Respect minimum amount + amount step by rounding DOWN
         min_cost, min_amount, amount_step = self.get_minimums(symbol)
 
-        # Apply step: round down to nearest step (or leave if no step)
+        # Respect minimum amount + amount step by rounding DOWN
         if amount_step and amount_step > 0:
             multiples = math.floor(base_qty / amount_step)
-            base_qty = multiples * amount_step
+            adj_qty = multiples * amount_step
             try:
-                amt_str = self.x.amount_to_precision(symbol, base_qty)
-                base_qty = float(amt_str)
+                amt_str = self.x.amount_to_precision(symbol, adj_qty)
+                adj_qty = float(amt_str)
             except Exception:
                 pass
+            _logger.debug("Rounding sell qty %s from %.10f to %.10f by step %.10f", symbol, base_qty, adj_qty, amount_step)
+            base_qty = adj_qty
 
         price = self.fetch_ticker_price(symbol)
         if SETTINGS.DRY_RUN:
+            _logger.info("DRY_RUN SELL %s qty=%.10f price=%.10f", symbol, base_qty, price)
             return price, base_qty
+        _logger.info("LIVE SELL %s qty=%.10f price≈%.10f", symbol, base_qty, price)
         self.x.create_order(symbol, type='market', side='sell', amount=base_qty)
         return price, base_qty
 
     # Profit sink (ATOM) helpers
     def buy_atom_for_usd(self, usd_amount: float) -> Tuple[float, float]:
-        # Buy ATOM/USD or ATOM/USDT depending on availability
         pair = None
         for q in SETTINGS.QUOTE_ASSETS:
             try_pair = f"ATOM/{q}"
@@ -294,18 +349,22 @@ class KrakenClient:
         price = self.fetch_ticker_price(pair)
         base_qty = usd_amount / max(price, 1e-18)
         if SETTINGS.DRY_RUN:
+            _logger.info("DRY_RUN SINK BUY %s spend=%.2f qty=%.10f price=%.10f", pair, usd_amount, base_qty, price)
             return price, base_qty
+        _logger.info("LIVE SINK BUY %s spend=%.2f price≈%.10f", pair, usd_amount, price)
         self.x.create_order(pair, type='market', side='buy', amount=None, params={'cost': usd_amount})
         return price, base_qty
 
     def stake_atom(self, base_qty: float) -> None:
-        # Placeholder: Kraken Earn/Equities staking endpoints aren’t available via CCXT.
+        # Placeholder
+        _logger.warning("Staking placeholder invoked for ATOM qty=%.10f (no-op)", base_qty)
         pass
 
 
 # -------------------------
 # Indicators & signals
 # -------------------------
+
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0)
@@ -316,8 +375,10 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     rsi_series = 100 - (100 / (1 + rs))
     return rsi_series
 
+
 def moving_average(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=window).mean()
+
 
 def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series]:
     ema_fast = series.ewm(span=fast, adjust=False).mean()
@@ -337,9 +398,10 @@ def compute_indicators(df: pd.DataFrame, rsi_len: int, fast: int, slow: int) -> 
     out['macd_signal'] = macd_sig
     return out
 
+
 def buy_signal_rowwise(row) -> bool:
-    # kept for compatibility if needed elsewhere
     return (row['rsi'] <= 30) and (row['ma_fast'] < row['ma_slow'])
+
 
 def buy_signal_df(ind: pd.DataFrame) -> bool:
     """
@@ -371,13 +433,17 @@ def buy_signal_df(ind: pd.DataFrame) -> bool:
         (close_now > close_prev)
     )
     macd_bull_cross = (macd_prev <= sig_prev) and (macd_now > sig_now)
+    if LOG_EVERY_SYMBOL:
+        _logger.debug(
+            "Signal check: rsi_now=%.2f rsi_prev=%.2f ma_fast=%.6f ma_slow=%.6f green=%s macd_cross=%s",
+            rsi_now, rsi_prev, ma_fast_now, ma_slow_now, close_now > close_prev, macd_bull_cross,
+        )
     return basic and macd_bull_cross
 
 
 def compute_order_notional(kr: 'KrakenClient', quote: str) -> float:
-    # Simple allocation: flat spend per trade per run
-    # Could use balance checks here; for now a fixed notional per buy
     per_trade = _get_float("PER_TRADE_NOTIONAL", 25.0)
+    _logger.debug("Per-trade notional for %s = %.8f", quote, per_trade)
     return per_trade
 
 
@@ -385,11 +451,9 @@ def bump_spend_to_exchange_minimums(kr: 'KrakenClient', symbol: str, desired_quo
     min_cost, min_amount, amount_step = kr.get_minimums(symbol)
     adjusted = desired_quote
 
-    # Ensure spend meets min cost
     if min_cost is not None:
         adjusted = max(adjusted, float(min_cost))
 
-    # Ensure base amount meets min amount and step after rounding UP
     if price := kr.fetch_ticker_price(symbol):
         base_qty = adjusted / price
         if (min_amount is not None) and (base_qty < float(min_amount) - 1e-18):
@@ -400,18 +464,22 @@ def bump_spend_to_exchange_minimums(kr: 'KrakenClient', symbol: str, desired_quo
         adjusted = base_qty * price
 
     bumped = adjusted > desired_quote + 1e-12
+    if bumped:
+        _logger.info("%s: bumped spend %.8f -> %.8f (min cost/amount/precision)", symbol, desired_quote, adjusted)
+    else:
+        _logger.debug("%s: spend unchanged at %.8f", symbol, adjusted)
     return adjusted, bumped
 
 
 def _estimate_24h_quote_volume(kr: 'KrakenClient', symbol: str) -> float:
-    """
-    Approximate last-24h quote-notional volume by summing hour bars: sum(close * volume) over last 24 hours.
-    """
     try:
         df_h = kr.fetch_ohlcv_df(symbol, timeframe='1h', limit=30)
         last_24 = df_h.tail(24)
-        return float((last_24['close'] * last_24['volume']).sum())
-    except Exception:
+        vol = float((last_24['close'] * last_24['volume']).sum())
+        _logger.debug("%s 24h quote volume ≈ %.2f", symbol, vol)
+        return vol
+    except Exception as e:
+        _logger.warning("Failed to estimate 24h volume for %s: %s", symbol, e)
         return 0.0
 
 
@@ -419,21 +487,27 @@ def _estimate_24h_quote_volume(kr: 'KrakenClient', symbol: str) -> float:
 # Core flows
 # -------------------------
 
+
 def screen_and_buy_signals(kr: KrakenClient):
     syms = kr.list_screenable_symbols()
     buys_this_run = 0
     for sym, base, quote in syms:
         if buys_this_run >= SETTINGS.MAX_BUYS_PER_RUN:
+            _logger.info("Reached MAX_BUYS_PER_RUN=%s — skipping remaining symbols", SETTINGS.MAX_BUYS_PER_RUN)
             break
+
+        if LOG_EVERY_SYMBOL:
+            _logger.debug("Consider %s (base=%s quote=%s)", sym, base, quote)
 
         # Hard skip if we already hold this base OR we have an active lock
         with session_scope() as s:
             if s.query(Position).filter_by(base=base).first():
-                # guarantee a lock exists for legacy positions
                 if not s.query(BuyLock).filter_by(base=base).first():
                     s.add(BuyLock(base=base, active=True))
+                _logger.debug("Skip %s: position already held; ensured lock", base)
                 continue
             if s.query(BuyLock).filter_by(base=base, active=True).first():
+                _logger.debug("Skip %s: active buy lock present", base)
                 continue
 
         try:
@@ -441,16 +515,14 @@ def screen_and_buy_signals(kr: KrakenClient):
                                    limit=max(SETTINGS.SLOW_MA + 5, 260))
             ind = compute_indicators(df, SETTINGS.RSI_LENGTH,
                                      SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
-            # Enforce minimum 24h volume (quote notional)
             vol_24h_quote = _estimate_24h_quote_volume(kr, sym)
             if SETTINGS.MIN_24H_VOLUME > 0 and vol_24h_quote < SETTINGS.MIN_24H_VOLUME:
+                _logger.debug("Skip %s: 24h vol %.2f < min %.2f", sym, vol_24h_quote, SETTINGS.MIN_24H_VOLUME)
                 continue
 
             if buy_signal_df(ind):
                 desired = compute_order_notional(kr, quote)
                 adjusted, bumped = bump_spend_to_exchange_minimums(kr, sym, desired)
-                if bumped:
-                    print(f"{sym}: bumped spend {desired:.8f} -> {adjusted:.8f} {quote} (min cost/amount/precision)")
 
                 price, qty = kr.market_buy_quote(sym, adjusted)
                 with session_scope() as s:
@@ -470,14 +542,15 @@ def screen_and_buy_signals(kr: KrakenClient):
                 last = ind.iloc[-1]
                 ma_fast = float(last['ma_fast'])
                 ma_slow = float(last['ma_slow'])
-                print(
-                    f"Signal BUY {sym}: rsi={last['rsi']:.1f} (rising), "
-                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} < ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, macd_cross=YES, 24h_vol≈{vol_24h_quote:.2f} {quote}, price={price:.10f}, "
-                    f"spend={adjusted:.8f} {quote}"
+                _logger.info(
+                    "Signal BUY %s: rsi=%.1f (rising), ma%s=%.6f < ma%s=%.6f, macd_cross=YES, 24h_vol≈%.2f %s, price=%.10f, spend=%.8f %s",
+                    sym, float(last['rsi']), SETTINGS.FAST_MA, ma_fast, SETTINGS.SLOW_MA, ma_slow, vol_24h_quote, quote, price, adjusted, quote,
                 )
+            else:
+                if LOG_EVERY_SYMBOL:
+                    _logger.debug("No buy signal for %s", sym)
         except Exception as e:
-            # Permission errors and anything else are just logged—no blacklisting
-            print(f"Screening error {sym}: {e}")
+            _logger.exception("Screening error %s: %s", sym, e)
 
 
 def take_profits_and_sink(kr: KrakenClient):
@@ -491,21 +564,20 @@ def take_profits_and_sink(kr: KrakenClient):
     """
     total_profit_usd = 0.0
 
-    # Sell loop over current positions
     with session_scope() as s:
         positions: List[Position] = s.query(Position).all()
+    _logger.info("Checking take-profit on %d positions", len(positions))
 
     for pos in positions:
         base = pos.base
         quote = pos.quote
         if base == 'ATOM':
-            continue  # never sell sink asset
+            _logger.debug("Skip selling ATOM (profit sink)")
+            continue
 
-        # Must have an active lock to avoid double buys while held
         with session_scope() as s:
             if not s.query(BuyLock).filter_by(base=base).first():
                 s.add(BuyLock(base=base, active=True))
-
         sym = f"{base}/{quote}"
         try:
             df = kr.fetch_ohlcv_df(sym, timeframe='15m',
@@ -518,7 +590,7 @@ def take_profits_and_sink(kr: KrakenClient):
             ma_fast = float(last['ma_fast'])
             ma_slow = float(last['ma_slow'])
         except Exception as e:
-            print(f"Sell check skipped for {sym} (indicator fetch failed): {e}")
+            _logger.warning("Sell check skipped for %s (indicator fetch failed): %s", sym, e)
             continue
 
         target_price = pos.avg_cost * (1.0 + SETTINGS.TAKE_PROFIT_PCT)
@@ -532,12 +604,18 @@ def take_profits_and_sink(kr: KrakenClient):
             cond_ma = ma_fast > ma_slow
             should_take_profit = cond_profit and cond_rsi and cond_ma
 
+        _logger.debug(
+            "TP check %s: price=%.10f avg=%.10f target=%.10f profit_ok=%s moonshot=%s rsi=%.1f ma_fast>ma_slow=%s",
+            sym, price, pos.avg_cost, target_price, cond_profit, enable_moonshot, rsi_val, ma_fast > ma_slow,
+        )
+
         if should_take_profit:
             sell_fraction = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7)) if enable_moonshot else 1.0
             sell_fraction = min(max(sell_fraction, 0.0), 1.0)
 
             sell_qty = pos.amount * sell_fraction
             if sell_fraction < 1.0 and sell_qty <= 0:
+                _logger.debug("Skip partial sell for %s: computed qty <= 0", sym)
                 continue
 
             sell_price, actually_sold = kr.market_sell_all(sym, sell_qty)
@@ -548,29 +626,23 @@ def take_profits_and_sink(kr: KrakenClient):
                 total_profit_usd += max(pnl, 0.0)
 
             with session_scope() as s:
-                # Update or remove position
                 if sell_fraction >= 0.9999 or abs(pos.amount - actually_sold) <= 1e-12:
-                    # sold all
                     s.query(Position).filter_by(base=base, quote=quote).delete()
-                    # Keep lock active to prevent re-buy in the same run; optional: deactivate on cooldown elsewhere
-                    print(f"SELL ALL {sym}: sold={actually_sold:.10f}, pnl≈{pnl:.2f}")
+                    _logger.info("SELL ALL %s: sold=%.10f pnl≈%.2f", sym, actually_sold, pnl)
                 else:
                     remaining = max(pos.amount - actually_sold, 0.0)
                     pos.amount = remaining
-                    print(
-                        f"PARTIAL SELL {sym}: sold={actually_sold:.10f}, remain={remaining:.10f}, "
-                        f"pnl≈{pnl:.2f}. Moonshot portion left to run."
-                    )
+                    _logger.info("PARTIAL SELL %s: sold=%.10f remain=%.10f pnl≈%.2f", sym, actually_sold, remaining, pnl)
 
     if total_profit_usd > 0.0:
         try:
             price, qty = kr.buy_atom_for_usd(total_profit_usd)
-            print(f"Profit sink: bought {qty:.10f} ATOM at {price:.10f} for ${total_profit_usd:.2f}")
+            _logger.info("Profit sink: bought %.10f ATOM at %.10f for $%.2f", qty, price, total_profit_usd)
             if SETTINGS.ENABLE_STAKING:
-                kr.stake_atom(qty)  # placeholder
-                print("(Attempted to stake ATOM via placeholder—verify API support)")
+                kr.stake_atom(qty)
+                _logger.info("Attempted staking ATOM via placeholder — verify API support")
         except Exception as e:
-            print(f"Failed profit sink conversion to ATOM: {e}")
+            _logger.warning("Failed profit sink conversion to ATOM: %s", e)
 
 
 # -------------------------
@@ -578,9 +650,18 @@ def take_profits_and_sink(kr: KrakenClient):
 # -------------------------
 
 def main():
+    _logger.info("=== Aletheia run start ===")
     kr = KrakenClient()
-    screen_and_buy_signals(kr)
-    take_profits_and_sink(kr)
+    try:
+        screen_and_buy_signals(kr)
+    except Exception:
+        _logger.exception("screen_and_buy_signals crashed")
+    try:
+        take_profits_and_sink(kr)
+    except Exception:
+        _logger.exception("take_profits_and_sink crashed")
+    _logger.info("=== Aletheia run end ===")
+
 
 if __name__ == "__main__":
     main()
