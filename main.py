@@ -16,38 +16,47 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.sql import func
 
-
 # -------------------------
 # Settings
 # -------------------------
-def _get_bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
-def _get_float(name: str, default: float) -> float:
-    val = os.getenv(name)
+def _get_bool(env: str, default: bool) -> bool:
+    v = os.getenv(env)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+def _get_int(env: str, default: int) -> int:
+    v = os.getenv(env)
     try:
-        return float(val) if val is not None else default
+        return int(v)
     except Exception:
         return default
 
-def _get_int(name: str, default: int) -> int:
-    val = os.getenv(name)
+def _get_float(env: str, default: float) -> float:
+    v = os.getenv(env)
     try:
-        return int(val) if val is not None else default
+        return float(v)
     except Exception:
         return default
 
-def _get_csv(name: str, default_list):
-    val = os.getenv(name)
-    if not val:
-        return list(default_list)
-    return [x.strip() for x in val.split(",") if x.strip()]
+def _get_csv(env: str, default: List[str]) -> List[str]:
+    v = os.getenv(env)
+    if not v:
+        return default
+    return [x.strip() for x in v.split(',') if x.strip()]
 
 class Settings:
-    # --- Database ---
+    # --- General ---
+    DRY_RUN = _get_bool("DRY_RUN", False)
+    ENABLE_STAKING = _get_bool("ENABLE_STAKING", False)
+    ENABLE_MOONSHOT = _get_bool("ENABLE_MOONSHOT", False)
+    MOONSHOT_SELL_FRACTION = _get_float("MOONSHOT_SELL_FRACTION", 0.7)
+    TAKE_PROFIT_PCT = _get_float("TAKE_PROFIT_PCT", 0.10)
+    MAX_BUYS_PER_RUN = _get_int("MAX_BUYS_PER_RUN", 3)
+
+    # DB
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./trading.db")
 
     # --- API keys ---
@@ -70,50 +79,22 @@ class Settings:
     RSI_LENGTH = _get_int("RSI_LENGTH", 14)
     FAST_MA    = _get_int("FAST_MA", 60)
     SLOW_MA    = _get_int("SLOW_MA", 240)
-
-    # --- Order sizing ---
-    ORDER_SIZE_MODE = os.getenv("ORDER_SIZE_MODE", "USD")    # "USD" or "PCT"
-    ORDER_SIZE_USD  = _get_float("ORDER_SIZE_USD", 20.0)
-    ORDER_SIZE_PCT  = _get_float("ORDER_SIZE_PCT", 0.05)     # 5% of free quote
-
-    # --- Profit taking ---
-    TAKE_PROFIT_PCT = _get_float("TAKE_PROFIT_PCT", 0.10)    # 10%
-
-    # --- Profit sink ---
-    PROFIT_SINK_SYMBOL = os.getenv("PROFIT_SINK_SYMBOL", "ATOM")
-    ENABLE_STAKING     = _get_bool("ENABLE_STAKING", False)
-
-    # --- Execution / dry-run ---
-    DRY_RUN = _get_bool("DRY_RUN", True)
-
-    # --- Loop / pacing ---
-    LOOP_SLEEP_SECONDS = _get_int("LOOP_SLEEP_SECONDS", 60)
-    PER_SYMBOL_DELAY_S = _get_int("PER_SYMBOL_DELAY_S", 0)
-
-    # --- Misc defaults (not used in live flow) ---
-    TAKER_FEE_PCT      = _get_float("TAKER_FEE_PCT", 0.001)  # 0.10%
-    MIN_NOTIONAL       = _get_float("MIN_NOTIONAL", 5.0)
-    BACKTEST_SEED_CASH = _get_float("BACKTEST_SEED_CASH", 10_000.0)
-
-    # --- Moonshot mode (partial take-profit) ---
-    ENABLE_MOONSHOT = _get_bool("ENABLE_MOONSHOT", False)
-    MOONSHOT_SELL_FRACTION = _get_float("MOONSHOT_SELL_FRACTION", 0.70)
-
-    # --- Safety cap for buys per run ---
-    MAX_BUYS_PER_RUN = _get_int("MAX_BUYS_PER_RUN", 3)
+    # MACD defaults
+    MACD_FAST  = 12
+    MACD_SLOW  = 26
+    MACD_SIG   = 9
 
 SETTINGS = Settings()
-
 
 # -------------------------
 # DB models
 # -------------------------
 Base = declarative_base()
-engine = create_engine(SETTINGS.DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+engine = create_engine(SETTINGS.DATABASE_URL, echo=False, future=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-class SeenMarket(Base):
-    __tablename__ = "seen_markets"
+class Symbol(Base):
+    __tablename__ = "symbols"
     id = Column(Integer, primary_key=True)
     symbol = Column(String, unique=True, index=True)
     base = Column(String, index=True)
@@ -128,14 +109,13 @@ class Position(Base):
     amount = Column(Float)             # base amount held
     avg_cost = Column(Float)           # in quote (e.g., USD per base)
     last_updated = Column(DateTime, server_default=func.now(), onupdate=func.now())
-    __table_args__ = (UniqueConstraint("base", "quote", name="uix_base_quote"),)
+    __table_args__ = (UniqueConstraint('base', 'quote', name='uq_position_base_quote'),)
 
 class BuyLock(Base):
     __tablename__ = "buy_locks"
     id = Column(Integer, primary_key=True)
-    base = Column(String, index=True)
-    active = Column(Boolean, default=True)  # one active buy at a time per base
-    __table_args__ = (UniqueConstraint("base", name="uix_buylock_base"),)
+    base = Column(String, unique=True, index=True)
+    active = Column(Boolean, default=True)
 
 class TradeLog(Base):
     __tablename__ = "trades"
@@ -147,15 +127,24 @@ class TradeLog(Base):
     price = Column(Float)
     amount = Column(Float)
     notional = Column(Float)
-    pnl = Column(Float, nullable=True) # for sells
-    ts = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, server_default=func.now())
 
-def init_db():
-    Base.metadata.create_all(engine)
+Base.metadata.create_all(bind=engine)
 
+@contextmanager
+def session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 # -------------------------
-# Exchange wrapper
+# Exchange wrapper (Kraken via CCXT)
 # -------------------------
 class KrakenClient:
     def __init__(self):
@@ -163,17 +152,72 @@ class KrakenClient:
             'apiKey': SETTINGS.KRAKEN_API_KEY,
             'secret': SETTINGS.KRAKEN_API_SECRET,
             'enableRateLimit': True,
-            'options': {'fetchOHLCVWarning': False}
         })
+        self.markets = None
 
-    def load_markets(self) -> Dict:
-        return self.x.load_markets(reload=True)
+    def load_markets(self):
+        if self.markets is None:
+            self.markets = self.x.load_markets()
+        return self.markets
 
-    def get_market(self, symbol: str) -> dict:
-        markets = self.x.load_markets()  # cached
-        return markets.get(symbol, {})
+    def get_market(self, symbol: str) -> Optional[dict]:
+        self.load_markets()
+        return self.markets.get(symbol)
 
-    def get_min_cost_amount_step(self, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    def fetch_ohlcv_df(self, symbol: str, timeframe: str = '15m', limit: int = 300) -> pd.DataFrame:
+        ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        return df
+
+    def fetch_ticker_price(self, symbol: str) -> float:
+        t = self.x.fetch_ticker(symbol)
+        return float(t['last'])
+
+    def list_screenable_symbols(self) -> List[Tuple[str, str, str]]:
+        """
+        Return list of (symbol, base, quote) we might trade.
+        Filters by QUOTE_ASSETS, blacklists, xStocks preferences, etc.
+        """
+        self.load_markets()
+        out = []
+        for sym, m in self.markets.items():
+            base = m.get('base')
+            quote = m.get('quote')
+            if not base or not quote:
+                continue
+
+            if SETTINGS.BASE_BLACKLIST and base in SETTINGS.BASE_BLACKLIST:
+                continue
+
+            is_xstock = base.endswith(SETTINGS.XSTOCKS_SUFFIX)
+            is_crypto = not is_xstock
+
+            if SETTINGS.XSTOCKS_ONLY:
+                if not is_xstock:
+                    continue
+            else:
+                if is_xstock and not SETTINGS.INCLUDE_XSTOCKS:
+                    continue
+                if is_crypto and not SETTINGS.INCLUDE_CRYPTO:
+                    continue
+
+            if quote not in SETTINGS.QUOTE_ASSETS:
+                continue
+
+            out.append((sym, base, quote))
+
+        # persist symbols table
+        with session_scope() as s:
+            for sym, base, quote in out:
+                if not s.query(Symbol).filter_by(symbol=sym).first():
+                    s.add(Symbol(symbol=sym, base=base, quote=quote))
+        return out
+
+    # -----------------
+    # Orders + minimums
+    # -----------------
+    def get_minimums(self, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
         Returns (min_cost, min_amount, amount_step).
         - min_cost: minimum quote notional
@@ -191,129 +235,32 @@ class KrakenClient:
         prec = (m.get('precision') or {}).get('amount')
         if isinstance(prec, (int, float)):
             try:
-                # If prec is decimals, step = 10^-prec
-                step = pow(10.0, -float(prec))
+                step = 10 ** (-int(prec))
             except Exception:
                 step = None
-        # If CCXT exposes a direct step in limits.amount.step, prefer it
-        step_direct = (limits.get('amount') or {}).get('step') if limits.get('amount') else None
-        if step_direct is not None:
-            step = float(step_direct)
+        # If exchange provides explicit step size, prefer it
+        step_size = (limits.get('amount') or {}).get('step')
+        if step_size is not None:
+            step = step_size
 
-        return (
-            float(cost_min) if cost_min is not None else None,
-            float(amount_min) if amount_min is not None else None,
-            float(step) if step is not None else None,
-        )
+        return cost_min, amount_min, step
 
-    def _is_xstock(self, base: str) -> bool:
-        if not base:
-            return False
-        if base.lower().endswith(SETTINGS.XSTOCKS_SUFFIX.lower()):
-            return True
-        if base.upper() in SETTINGS.XSTOCKS_BASES:
-            return True
-        return False
-
-    def list_screenable_symbols(self) -> List[Tuple[str, str, str]]:
-        mkts = self.load_markets()
-        out: List[Tuple[str, str, str]] = []
-        for sym, m in mkts.items():
-            base = m.get('base')
-            quote = m.get('quote')
-            if not base or not quote:
-                continue
-            if quote not in SETTINGS.QUOTE_ASSETS:
-                continue
-            if not m.get('active', True):
-                continue
-            if base in SETTINGS.BASE_BLACKLIST:
-                continue
-
-            is_x = self._is_xstock(base)
-            if SETTINGS.XSTOCKS_ONLY:
-                if SETTINGS.INCLUDE_XSTOCKS and is_x:
-                    out.append((sym, base, quote))
-                continue
-
-            if is_x and SETTINGS.INCLUDE_XSTOCKS:
-                out.append((sym, base, quote))
-            elif (not is_x) and SETTINGS.INCLUDE_CRYPTO:
-                out.append((sym, base, quote))
-        return out
-
-    def fetch_ohlcv_df(self, symbol: str, timeframe: str = '15m', limit: int = 300) -> pd.DataFrame:
-        ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        return df
-
-    def fetch_ticker_price(self, symbol: str) -> float:
-        t = self.x.fetch_ticker(symbol)
-        return float(t['last'])
-
-    def get_free_balance(self, currency: str) -> float:
-        try:
-            bal = self.x.fetch_free_balance()
-            return float(bal.get(currency, 0.0) or 0.0)
-        except Exception:
-            return 0.0
-
-    def _amount_to_precision_ceil(self, symbol: str, amount: float, step: Optional[float]) -> float:
-        """
-        Convert amount to a valid tradable amount, rounding UP to the next step if needed.
-        Uses CCXT's amount_to_precision to enforce decimal places, then adjusts upward
-        to meet a known step if provided.
-        """
-        if amount <= 0:
-            return 0.0
-        # First adhere to decimal precision CCXT expects
-        try:
-            amt_str = self.x.amount_to_precision(symbol, amount)
-            amt = float(amt_str)
-        except Exception:
-            amt = amount
-
-        if step and step > 0:
-            # ceil to next multiple of 'step'
-            multiples = math.ceil(amt / step)
-            amt = multiples * step
-            # Re-apply precision formatting after stepping
-            try:
-                amt_str = self.x.amount_to_precision(symbol, amt)
-                amt = float(amt_str)
-            except Exception:
-                pass
-        return amt
-
-    def market_buy_quote(self, symbol: str, quote_notional: float) -> Tuple[float, float]:
-        """
-        Market buy spending 'quote_notional' units of the QUOTE currency (USD/USDT).
-        Returns (price, base_qty) actually requested.
-        """
+    def market_buy_quote(self, symbol: str, quote_amount: float) -> Tuple[float, float]:
         price = self.fetch_ticker_price(symbol)
-        base_qty = quote_notional / price if price > 0 else 0.0
-
-        # Enforce precision/step by rounding UP
-        _, min_amount, amount_step = self.get_min_cost_amount_step(symbol)
-        base_qty = self._amount_to_precision_ceil(symbol, base_qty, amount_step)
-
         if SETTINGS.DRY_RUN:
+            # Simulate fills greedily
+            base_qty = quote_amount / max(price, 1e-18)
             return price, base_qty
-
-        self.x.create_order(symbol, type='market', side='buy', amount=base_qty)
-        return price, base_qty
+        order = self.x.create_order(symbol, type='market', side='buy', amount=None, params={'cost': quote_amount})
+        filled_base = float(order.get('filled', 0.0))
+        return price, filled_base
 
     def market_sell_all(self, symbol: str, base_qty: float) -> Tuple[float, float]:
-        # For sells, round DOWN a hair to avoid “too much” errors, but still respect precision
-        _, _, amount_step = self.get_min_cost_amount_step(symbol)
-        try:
-            amt_str = self.x.amount_to_precision(symbol, base_qty)
-            base_qty = float(amt_str)
-        except Exception:
-            pass
+        # Respect minimum amount + amount step by rounding DOWN
+        min_cost, min_amount, amount_step = self.get_minimums(symbol)
+
+        # Apply step: round down to nearest step (or leave if no step)
         if amount_step and amount_step > 0:
-            # floor to step
             multiples = math.floor(base_qty / amount_step)
             base_qty = multiples * amount_step
             try:
@@ -328,15 +275,28 @@ class KrakenClient:
         self.x.create_order(symbol, type='market', side='sell', amount=base_qty)
         return price, base_qty
 
+    # Profit sink (ATOM) helpers
     def buy_atom_for_usd(self, usd_amount: float) -> Tuple[float, float]:
-        # Prefer USD quote if available, else USDT
+        # Buy ATOM/USD or ATOM/USDT depending on availability
+        pair = None
         for q in SETTINGS.QUOTE_ASSETS:
-            sym = f"{SETTINGS.PROFIT_SINK_SYMBOL}/{q}"
+            try_pair = f"ATOM/{q}"
             try:
-                return self.market_buy_quote(sym, usd_amount)
+                self.get_market(try_pair) or self.x.load_markets()
+                self.get_market(try_pair)
+                pair = try_pair
+                break
             except Exception:
                 continue
-        raise RuntimeError("No ATOM/* market available for quotes: " + ",".join(SETTINGS.QUOTE_ASSETS))
+        if not pair:
+            raise RuntimeError("No ATOM/* market available for quotes: " + ",".join(SETTINGS.QUOTE_ASSETS))
+
+        price = self.fetch_ticker_price(pair)
+        base_qty = usd_amount / max(price, 1e-18)
+        if SETTINGS.DRY_RUN:
+            return price, base_qty
+        self.x.create_order(pair, type='market', side='buy', amount=None, params={'cost': usd_amount})
+        return price, base_qty
 
     def stake_atom(self, base_qty: float) -> None:
         # Placeholder: Kraken Earn/Equities staking endpoints aren’t available via CCXT.
@@ -352,18 +312,29 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     down = -delta.clip(upper=0)
     roll_up = up.ewm(alpha=1/length, adjust=False).mean()
     roll_down = down.ewm(alpha=1/length, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-9)
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val
+    rs = roll_up / roll_down.replace(0, 1e-18)
+    rsi_series = 100 - (100 / (1 + rs))
+    return rsi_series
 
 def moving_average(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=window).mean()
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series]:
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
+
 
 def compute_indicators(df: pd.DataFrame, rsi_len: int, fast: int, slow: int) -> pd.DataFrame:
     out = df.copy()
     out['rsi'] = rsi(out['close'], rsi_len)
     out['ma_fast'] = moving_average(out['close'], fast)
     out['ma_slow'] = moving_average(out['close'], slow)
+    macd_line, macd_sig = macd(out['close'], SETTINGS.MACD_FAST, SETTINGS.MACD_SLOW, SETTINGS.MACD_SIG)
+    out['macd'] = macd_line
+    out['macd_signal'] = macd_sig
     return out
 
 def buy_signal_rowwise(row) -> bool:
@@ -372,11 +343,12 @@ def buy_signal_rowwise(row) -> bool:
 
 def buy_signal_df(ind: pd.DataFrame) -> bool:
     """
-    Tightened buy: oversold + bearish, but require early turn:
+    Tightened buy: oversold + bearish, but require early turn and MACD bull cross:
       - RSI <= 30
       - MA_fast < MA_slow (downtrend)
       - RSI rising vs previous bar
       - Close is a green bar vs previous close
+      - MACD crosses above signal
     """
     if len(ind) < 2:
         return False
@@ -387,165 +359,65 @@ def buy_signal_df(ind: pd.DataFrame) -> bool:
     ma_slow_now = float(last2['ma_slow'].iloc[-1])
     close_now = float(last2['close'].iloc[-1])
     close_prev = float(last2['close'].iloc[-2])
+    macd_now = float(last2['macd'].iloc[-1])
+    macd_prev = float(last2['macd'].iloc[-2])
+    sig_now = float(last2['macd_signal'].iloc[-1])
+    sig_prev = float(last2['macd_signal'].iloc[-2])
 
-    return (
+    basic = (
         (rsi_now <= 30.0) and
         (ma_fast_now < ma_slow_now) and
         (rsi_now > rsi_prev) and
         (close_now > close_prev)
     )
+    macd_bull_cross = (macd_prev <= sig_prev) and (macd_now > sig_now)
+    return basic and macd_bull_cross
 
 
-# -------------------------
-# Orchestration helpers
-# -------------------------
-BUMP_BUFFER = 1.01  # 1% safety buffer above calculated minimums
+def compute_order_notional(kr: 'KrakenClient', quote: str) -> float:
+    # Simple allocation: flat spend per trade per run
+    # Could use balance checks here; for now a fixed notional per buy
+    per_trade = _get_float("PER_TRADE_NOTIONAL", 25.0)
+    return per_trade
 
-def required_spend_for_amount(symbol: str, price: float, amount: float) -> float:
-    if price and price > 0:
-        return amount * price
-    return 0.0
 
-def bump_spend_to_exchange_minimums(kr: KrakenClient, symbol: str, desired_spend: float) -> Tuple[float, bool]:
-    """
-    Bump spend to satisfy:
-      - min cost (quote notional)
-      - min amount (base)
-      - amount step/precision (by rounding UP to next valid step)
-    Returns (adjusted_spend, was_bumped)
-    """
-    if desired_spend <= 0:
-        return 0.0, False
-
-    min_cost, min_amount, amount_step = kr.get_min_cost_amount_step(symbol)
-    try:
-        price = kr.fetch_ticker_price(symbol)
-    except Exception:
-        price = 0.0
-
-    adjusted = desired_spend
+def bump_spend_to_exchange_minimums(kr: 'KrakenClient', symbol: str, desired_quote: float) -> Tuple[float, bool]:
+    min_cost, min_amount, amount_step = kr.get_minimums(symbol)
+    adjusted = desired_quote
 
     # Ensure spend meets min cost
     if min_cost is not None:
         adjusted = max(adjusted, float(min_cost))
 
     # Ensure base amount meets min amount and step after rounding UP
-    if price and price > 0:
-        # target base amount from current spend
+    if price := kr.fetch_ticker_price(symbol):
         base_qty = adjusted / price
-
-        # apply min amount if any
         if (min_amount is not None) and (base_qty < float(min_amount) - 1e-18):
             base_qty = float(min_amount)
-
-        # apply step: round UP to next valid increment
         if amount_step and amount_step > 0:
-            base_qty = math.ceil(base_qty / amount_step) * amount_step
+            multiples = math.ceil(base_qty / amount_step)
+            base_qty = multiples * amount_step
+        adjusted = base_qty * price
 
-        # re-compute spend from the rounded/stepped amount
-        adjusted = required_spend_for_amount(symbol, price, base_qty)
-
-    # Add tiny buffer to avoid boundary rejects
-    adjusted *= BUMP_BUFFER
-    return adjusted, (adjusted > desired_spend + 1e-12)
+    bumped = adjusted > desired_quote + 1e-12
+    return adjusted, bumped
 
 
-@contextmanager
-def session_scope():
-    s = SessionLocal()
+def _estimate_24h_quote_volume(kr: 'KrakenClient', symbol: str) -> float:
+    """
+    Approximate last-24h quote-notional volume by summing hour bars: sum(close * volume) over last 24 hours.
+    """
     try:
-        yield s
-        s.commit()
+        df_h = kr.fetch_ohlcv_df(symbol, timeframe='1h', limit=30)
+        last_24 = df_h.tail(24)
+        return float((last_24['close'] * last_24['volume']).sum())
     except Exception:
-        s.rollback()
-        raise
-    finally:
-        s.close()
+        return 0.0
 
-def validate_settings():
-    assert SETTINGS.FAST_MA < SETTINGS.SLOW_MA, "FAST_MA must be < SLOW_MA"
-    if getattr(SETTINGS, "ENABLE_MOONSHOT", False):
-        frac = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7))
-        assert 0.0 < frac < 1.0, "MOONSHOT_SELL_FRACTION must be in (0,1)"
 
-def compute_order_notional(kr: KrakenClient, quote: str) -> float:
-    """
-    Returns how much QUOTE (USD/USDT) to spend for this order based on env:
-      - ORDER_SIZE_MODE=USD -> ORDER_SIZE_USD
-      - ORDER_SIZE_MODE=PCT -> ORDER_SIZE_PCT * free balance of QUOTE
-    """
-    mode = (SETTINGS.ORDER_SIZE_MODE or "USD").upper()
-    if mode == "PCT":
-        avail = kr.get_free_balance(quote)
-        spend = max(0.0, avail * SETTINGS.ORDER_SIZE_PCT)
-        return spend
-    return SETTINGS.ORDER_SIZE_USD
-
-def seed_markets_if_empty(kr: KrakenClient) -> bool:
-    """
-    If the seen_markets table is empty, seed it with ALL current markets (no buys).
-    Returns True if we seeded, False if not.
-    """
-    syms = kr.list_screenable_symbols()
-    with session_scope() as s:
-        count = s.query(SeenMarket).count()
-        if count > 0:
-            return False
-        for sym, base, quote in syms:
-            s.add(SeenMarket(symbol=sym, base=base, quote=quote))
-    print(f"Bootstrap: seeded {len(syms)} markets — no buys on first run.")
-    return True
-
-def find_new_markets(kr: KrakenClient):
-    """
-    Return only markets that are NOT in seen_markets yet (true new listings since last run).
-    """
-    syms = kr.list_screenable_symbols()
-    new_symbols = []
-    with session_scope() as s:
-        for sym, base, quote in syms:
-            if not s.query(SeenMarket).filter_by(symbol=sym).first():
-                s.add(SeenMarket(symbol=sym, base=base, quote=quote))
-                new_symbols.append((sym, base, quote))
-    return new_symbols
-
-def buy_new_listings(kr: KrakenClient, new_symbols):
-    buys_this_run = 0
-    for sym, base, quote in new_symbols:
-        if buys_this_run >= SETTINGS.MAX_BUYS_PER_RUN:
-            break
-        try:
-            # Hard skip if we already hold this base (any quote)
-            with session_scope() as s:
-                if s.query(Position).filter_by(base=base).first():
-                    # ensure a lock exists for legacy positions
-                    if not s.query(BuyLock).filter_by(base=base).first():
-                        s.add(BuyLock(base=base, active=True))
-                    continue
-
-            desired = compute_order_notional(kr, quote)
-            adjusted, bumped = bump_spend_to_exchange_minimums(kr, sym, desired)
-            if bumped:
-                print(f"{sym}: bumped spend {desired:.8f} -> {adjusted:.8f} {quote} (min cost/amount/precision)")
-
-            price, qty = kr.market_buy_quote(sym, adjusted)
-            with session_scope() as s:
-                if not s.query(BuyLock).filter_by(base=base).first():
-                    s.add(BuyLock(base=base, active=True))
-                pos = s.query(Position).filter_by(base=base, quote=quote).first()
-                if pos:
-                    new_amount = pos.amount + qty
-                    new_cost = (pos.avg_cost * pos.amount + price * qty) / max(new_amount, 1e-9)
-                    pos.amount = new_amount
-                    pos.avg_cost = new_cost
-                else:
-                    s.add(Position(base=base, quote=quote, amount=qty, avg_cost=price))
-                s.add(TradeLog(side="BUY", symbol=sym, base=base, quote=quote,
-                               price=price, amount=qty, notional=price * qty))
-            buys_this_run += 1
-            print(f"New listing buy: {sym} spend={adjusted:.8f} {quote} at {price:.10f}")
-        except Exception as e:
-            print(f"Buy error {sym}: {e}")
+# -------------------------
+# Core flows
+# -------------------------
 
 def screen_and_buy_signals(kr: KrakenClient):
     syms = kr.list_screenable_symbols()
@@ -569,6 +441,11 @@ def screen_and_buy_signals(kr: KrakenClient):
                                    limit=max(SETTINGS.SLOW_MA + 5, 260))
             ind = compute_indicators(df, SETTINGS.RSI_LENGTH,
                                      SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
+            # Enforce minimum 24h volume (quote notional)
+            vol_24h_quote = _estimate_24h_quote_volume(kr, sym)
+            if SETTINGS.MIN_24H_VOLUME > 0 and vol_24h_quote < SETTINGS.MIN_24H_VOLUME:
+                continue
+
             if buy_signal_df(ind):
                 desired = compute_order_notional(kr, quote)
                 adjusted, bumped = bump_spend_to_exchange_minimums(kr, sym, desired)
@@ -595,82 +472,90 @@ def screen_and_buy_signals(kr: KrakenClient):
                 ma_slow = float(last['ma_slow'])
                 print(
                     f"Signal BUY {sym}: rsi={last['rsi']:.1f} (rising), "
-                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} < ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={price:.10f}, "
+                    f"ma{SETTINGS.FAST_MA}={ma_fast:.6f} < ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, macd_cross=YES, 24h_vol≈{vol_24h_quote:.2f} {quote}, price={price:.10f}, "
                     f"spend={adjusted:.8f} {quote}"
                 )
         except Exception as e:
             # Permission errors and anything else are just logged—no blacklisting
             print(f"Screening error {sym}: {e}")
 
+
 def take_profits_and_sink(kr: KrakenClient):
     """
-    SELL RULE (all must be true):
-      - RSI(14) >= 70
-      - MA60 > MA240  (15m bars)
+    SELL RULES:
+      - If ENABLE_MOONSHOT is False: sell ALL when price >= avg_cost * (1 + TAKE_PROFIT_PCT).
+      - If ENABLE_MOONSHOT is True: require RSI>=70 and MA_fast>MA_slow and price >= target; sell fraction.
       - Price >= avg_cost * (1 + TAKE_PROFIT_PCT)
     Never sell ATOM (profit sink asset).
     If ENABLE_MOONSHOT, sell only a fraction and keep remainder.
     """
     total_profit_usd = 0.0
+
+    # Sell loop over current positions
     with session_scope() as s:
-        positions = s.query(Position).all()
-        for pos in positions:
-            if pos.base == SETTINGS.PROFIT_SINK_SYMBOL:
-                continue
+        positions: List[Position] = s.query(Position).all()
 
-            sym = f"{pos.base}/{pos.quote}"
-            try:
-                df = kr.fetch_ohlcv_df(sym, timeframe='15m',
-                                       limit=max(SETTINGS.SLOW_MA + 5, 260))
-                ind = compute_indicators(df, SETTINGS.RSI_LENGTH,
-                                         SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
-                last = ind.iloc[-1]
-                price = float(last['close'])
-                rsi_val = float(last['rsi'])
-                ma_fast = float(last['ma_fast'])
-                ma_slow = float(last['ma_slow'])
-            except Exception as e:
-                print(f"Sell check skipped for {sym} (indicator fetch failed): {e}")
-                continue
+    for pos in positions:
+        base = pos.base
+        quote = pos.quote
+        if base == 'ATOM':
+            continue  # never sell sink asset
 
+        # Must have an active lock to avoid double buys while held
+        with session_scope() as s:
+            if not s.query(BuyLock).filter_by(base=base).first():
+                s.add(BuyLock(base=base, active=True))
+
+        sym = f"{base}/{quote}"
+        try:
+            df = kr.fetch_ohlcv_df(sym, timeframe='15m',
+                                   limit=max(SETTINGS.SLOW_MA + 5, 260))
+            ind = compute_indicators(df, SETTINGS.RSI_LENGTH,
+                                     SETTINGS.FAST_MA, SETTINGS.SLOW_MA)
+            last = ind.iloc[-1]
+            price = float(last['close'])
+            rsi_val = float(last['rsi'])
+            ma_fast = float(last['ma_fast'])
+            ma_slow = float(last['ma_slow'])
+        except Exception as e:
+            print(f"Sell check skipped for {sym} (indicator fetch failed): {e}")
+            continue
+
+        target_price = pos.avg_cost * (1.0 + SETTINGS.TAKE_PROFIT_PCT)
+        cond_profit = price >= target_price
+
+        enable_moonshot = bool(getattr(SETTINGS, "ENABLE_MOONSHOT", False))
+        if not enable_moonshot:
+            should_take_profit = cond_profit
+        else:
             cond_rsi = rsi_val >= 70.0
             cond_ma = ma_fast > ma_slow
-            target_price = pos.avg_cost * (1.0 + SETTINGS.TAKE_PROFIT_PCT)
-            cond_profit = price >= target_price
-            should_take_profit = cond_rsi and cond_ma and cond_profit
+            should_take_profit = cond_profit and cond_rsi and cond_ma
 
-            if should_take_profit:
-                enable_moonshot = bool(getattr(SETTINGS, "ENABLE_MOONSHOT", False))
-                sell_fraction = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7)) if enable_moonshot else 1.0
-                sell_fraction = min(max(sell_fraction, 0.0), 1.0)
+        if should_take_profit:
+            sell_fraction = float(getattr(SETTINGS, "MOONSHOT_SELL_FRACTION", 0.7)) if enable_moonshot else 1.0
+            sell_fraction = min(max(sell_fraction, 0.0), 1.0)
 
-                sell_qty = pos.amount * sell_fraction
-                if sell_fraction < 1.0 and sell_qty <= 0:
-                    continue
+            sell_qty = pos.amount * sell_fraction
+            if sell_fraction < 1.0 and sell_qty <= 0:
+                continue
 
-                sell_price, actually_sold = kr.market_sell_all(sym, sell_qty)
-                notional = sell_price * actually_sold
-                cost = pos.avg_cost * actually_sold
-                pnl = notional - cost
-                if pos.quote in ("USD", "USDT"):
-                    total_profit_usd += pnl
+            sell_price, actually_sold = kr.market_sell_all(sym, sell_qty)
+            notional = sell_price * actually_sold
+            cost = pos.avg_cost * actually_sold
+            pnl = notional - cost
+            if pos.quote in ("USD", "USDT"):
+                total_profit_usd += max(pnl, 0.0)
 
-                s.add(TradeLog(side="SELL", symbol=sym, base=pos.base, quote=pos.quote,
-                               price=sell_price, amount=actually_sold, notional=notional, pnl=pnl))
-
-                remaining = pos.amount - actually_sold
-                if remaining <= 0:
-                    s.delete(pos)
-                    bl = s.query(BuyLock).filter_by(base=pos.base, active=True).first()
-                    if bl:
-                        s.delete(bl)
-                    profit_pct = (sell_price / pos.avg_cost - 1.0) * 100.0
-                    print(
-                        f"SELL {sym}: rsi={rsi_val:.1f} (>=70), ma{SETTINGS.FAST_MA}={ma_fast:.6f} > "
-                        f"ma{SETTINGS.SLOW_MA}={ma_slow:.6f}, price={sell_price:.10f} (avg={pos.avg_cost:.10f}, "
-                        f"+{profit_pct:.2f}%), pnl≈{pnl:.2f}"
-                    )
+            with session_scope() as s:
+                # Update or remove position
+                if sell_fraction >= 0.9999 or abs(pos.amount - actually_sold) <= 1e-12:
+                    # sold all
+                    s.query(Position).filter_by(base=base, quote=quote).delete()
+                    # Keep lock active to prevent re-buy in the same run; optional: deactivate on cooldown elsewhere
+                    print(f"SELL ALL {sym}: sold={actually_sold:.10f}, pnl≈{pnl:.2f}")
                 else:
+                    remaining = max(pos.amount - actually_sold, 0.0)
                     pos.amount = remaining
                     print(
                         f"PARTIAL SELL {sym}: sold={actually_sold:.10f}, remain={remaining:.10f}, "
@@ -685,43 +570,17 @@ def take_profits_and_sink(kr: KrakenClient):
                 kr.stake_atom(qty)  # placeholder
                 print("(Attempted to stake ATOM via placeholder—verify API support)")
         except Exception as e:
-            print(f"Failed profit sink buy ATOM: {e}")
+            print(f"Failed profit sink conversion to ATOM: {e}")
 
-def sync_buylocks_with_positions():
-    """
-    Ensure a BuyLock exists for every held base across any quote.
-    This prevents accidental additional buys if legacy runs lacked locks.
-    """
-    with session_scope() as s:
-        held_bases = {p.base for p in s.query(Position).all() if (p.amount or 0) > 0}
-        for b in held_bases:
-            if not s.query(BuyLock).filter_by(base=b).first():
-                s.add(BuyLock(base=b, active=True))
 
-def run_once():
-    validate_settings()
-    init_db()
+# -------------------------
+# Entrypoint
+# -------------------------
+
+def main():
     kr = KrakenClient()
-
-    # One-time sanity: guarantee locks for held positions
-    sync_buylocks_with_positions()
-
-    bootstrapped = seed_markets_if_empty(kr)
-    new_syms = find_new_markets(kr)
-
-    if (not bootstrapped) and new_syms:
-        buy_new_listings(kr, new_syms)
-
     screen_and_buy_signals(kr)
     take_profits_and_sink(kr)
 
 if __name__ == "__main__":
-    run_once()
-    # Uncomment to loop:
-    # import time
-    # while True:
-    #     try:
-    #         run_once()
-    #     except Exception as e:
-    #         print("Run error:", e)
-    #     time.sleep(SETTINGS.LOOP_SLEEP_SECONDS)
+    main()
