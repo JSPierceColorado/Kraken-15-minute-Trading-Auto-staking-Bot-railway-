@@ -1,5 +1,5 @@
 # =============================
-# main.py (simplified buy logic; removed MACD/green candle dependencies)
+# main.py (simplified indicators and buy logic)
 # =============================
 
 import os
@@ -7,8 +7,7 @@ import sys
 import math
 import logging
 from contextlib import contextmanager
-from typing import List, Dict, Tuple, Optional
-
+from typing import List, Tuple, Optional
 import pandas as pd
 import ccxt
 from sqlalchemy import (
@@ -73,53 +72,27 @@ if not _logger.handlers:
 # -------------------------
 
 class Settings:
-    # --- General ---
     DRY_RUN = _get_bool("DRY_RUN", False)
-    ENABLE_STAKING = _get_bool("ENABLE_STAKING", False)
-    ENABLE_MOONSHOT = _get_bool("ENABLE_MOONSHOT", False)
-    MOONSHOT_SELL_FRACTION = _get_float("MOONSHOT_SELL_FRACTION", 0.7)
-    TAKE_PROFIT_PCT = _get_float("TAKE_PROFIT_PCT", 0.10)
-    MAX_BUYS_PER_RUN = _get_int("MAX_BUYS_PER_RUN", 3)
-
-    # DB
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./trading.db")
-
-    # --- API keys ---
     KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
     KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
-
-    # --- Universe / filters ---
-    QUOTE_ASSETS   = _get_csv("QUOTE_ASSETS", ["USD", "USDT"])
-    INCLUDE_CRYPTO = _get_bool("INCLUDE_CRYPTO", True)
-    INCLUDE_XSTOCKS = _get_bool("INCLUDE_XSTOCKS", True)
-    XSTOCKS_ONLY   = _get_bool("XSTOCKS_ONLY", False)
-    XSTOCKS_SUFFIX = os.getenv("XSTOCKS_SUFFIX", "x")
-    XSTOCKS_BASES  = set(_get_csv("XSTOCKS_BASES", []))
-
-    # Optional guardrails
-    MIN_24H_VOLUME = _get_float("MIN_24H_VOLUME", 0.0)
-    BASE_BLACKLIST = set(_get_csv("BASE_BLACKLIST", []))
-
-    # --- Indicator settings ---
+    QUOTE_ASSETS = _get_csv("QUOTE_ASSETS", ["USD", "USDT"])
     RSI_LENGTH = _get_int("RSI_LENGTH", 14)
-    FAST_MA    = _get_int("FAST_MA", 60)
-    SLOW_MA    = _get_int("SLOW_MA", 240)
-    # MACD defaults
-    MACD_FAST  = 12
-    MACD_SLOW  = 26
-    MACD_SIG   = 9
+    FAST_MA = _get_int("FAST_MA", 60)
+    SLOW_MA = _get_int("SLOW_MA", 240)
+    MAX_BUYS_PER_RUN = _get_int("MAX_BUYS_PER_RUN", 3)
 
 SETTINGS = Settings()
 
 _logger.info(
-    "Settings: DRY_RUN=%s MAX_BUYS_PER_RUN=%s TAKE_PROFIT_PCT=%.3f MOONSHOT=%s QUOTES=%s MIN_24H_VOL=%.2f",
-    SETTINGS.DRY_RUN, SETTINGS.MAX_BUYS_PER_RUN, SETTINGS.TAKE_PROFIT_PCT,
-    SETTINGS.ENABLE_MOONSHOT, ",".join(SETTINGS.QUOTE_ASSETS), SETTINGS.MIN_24H_VOLUME,
+    "Settings: DRY_RUN=%s MAX_BUYS_PER_RUN=%s QUOTES=%s",
+    SETTINGS.DRY_RUN, SETTINGS.MAX_BUYS_PER_RUN, ",".join(SETTINGS.QUOTE_ASSETS),
 )
 
 # -------------------------
-# DB models
+# DB setup
 # -------------------------
+
 Base = declarative_base()
 engine = create_engine(SETTINGS.DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -132,36 +105,7 @@ class Symbol(Base):
     quote = Column(String, index=True)
     first_seen = Column(DateTime, server_default=func.now())
 
-class Position(Base):
-    __tablename__ = "positions"
-    id = Column(Integer, primary_key=True)
-    base = Column(String, index=True)
-    quote = Column(String, index=True)
-    amount = Column(Float)
-    avg_cost = Column(Float)
-    last_updated = Column(DateTime, server_default=func.now(), onupdate=func.now())
-    __table_args__ = (UniqueConstraint('base', 'quote', name='uq_position_base_quote'),)
-
-class BuyLock(Base):
-    __tablename__ = "buy_locks"
-    id = Column(Integer, primary_key=True)
-    base = Column(String, unique=True, index=True)
-    active = Column(Boolean, default=True)
-
-class TradeLog(Base):
-    __tablename__ = "trades"
-    id = Column(Integer, primary_key=True)
-    side = Column(String)
-    symbol = Column(String)
-    base = Column(String)
-    quote = Column(String)
-    price = Column(Float)
-    amount = Column(Float)
-    notional = Column(Float)
-    created_at = Column(DateTime, server_default=func.now())
-
 Base.metadata.create_all(bind=engine)
-_logger.info("Database initialized at %s", SETTINGS.DATABASE_URL)
 
 @contextmanager
 def session_scope():
@@ -177,8 +121,9 @@ def session_scope():
         session.close()
 
 # -------------------------
-# Exchange wrapper (Kraken via CCXT)
+# Exchange client
 # -------------------------
+
 class KrakenClient:
     def __init__(self):
         self.x = ccxt.kraken({
@@ -202,12 +147,8 @@ class KrakenClient:
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
 
-    def fetch_ticker_price(self, symbol: str) -> float:
-        t = self.x.fetch_ticker(symbol)
-        return float(t['last'])
-
 # -------------------------
-# Indicators & signals
+# Indicators
 # -------------------------
 
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -222,26 +163,20 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
 def moving_average(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=window).mean()
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series]:
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line
-
 def compute_indicators(df: pd.DataFrame, rsi_len: int, fast: int, slow: int) -> pd.DataFrame:
     out = df.copy()
     out['rsi'] = rsi(out['close'], rsi_len)
     out['ma_fast'] = moving_average(out['close'], fast)
     out['ma_slow'] = moving_average(out['close'], slow)
-    macd_line, macd_sig = macd(out['close'], SETTINGS.MACD_FAST, SETTINGS.MACD_SLOW, SETTINGS.MACD_SIG)
-    out['macd'] = macd_line
-    out['macd_signal'] = macd_sig
     return out
+
+# -------------------------
+# Buy signal
+# -------------------------
 
 def buy_signal_df(ind: pd.DataFrame) -> bool:
     """
-    Simplified buy signal:
+    Buy when:
       - RSI <= 30 (oversold)
       - MA_fast < MA_slow (downtrend)
       - RSI rising vs previous bar
@@ -254,10 +189,10 @@ def buy_signal_df(ind: pd.DataFrame) -> bool:
     ma_fast_now = float(last2['ma_fast'].iloc[-1])
     ma_slow_now = float(last2['ma_slow'].iloc[-1])
 
-    return (rsi_now <= 30.0) and (ma_fast_now < ma_slow_now) and (rsi_now > rsi_prev))
+    return (rsi_now <= 30.0) and (ma_fast_now < ma_slow_now) and (rsi_now > rsi_prev)
 
 # -------------------------
-# Core flows
+# Core flow
 # -------------------------
 
 def screen_and_buy_signals(kr: KrakenClient):
